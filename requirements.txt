@@ -1,0 +1,43 @@
+# ── Core ─────────────────────────────────────────────────────
+python-dotenv>=1.0.0          # environment variables dari .env
+
+# ── Database ──────────────────────────────────────────────────
+SQLAlchemy>=2.0.0             # ORM database
+PyMySQL>=1.1.0                # MariaDB/MySQL connector
+greenlet>=3.0.0               # dependency SQLAlchemy async
+
+# ── Monitoring ────────────────────────────────────────────────
+easysnmp>=0.2.6               # SNMP polling (butuh libsnmp-dev di sistem)
+icmplib>=3.0.0                # ping/ICMP (butuh setcap cap_net_raw)
+schedule>=1.2.0               # job scheduler
+
+# ── API Server ────────────────────────────────────────────────
+fastapi>=0.100.0              # REST API framework
+uvicorn>=0.23.0               # ASGI server
+pydantic>=2.0.0               # data validation (dependency FastAPI)
+starlette>=0.27.0             # dependency FastAPI
+anyio>=3.7.0                  # async support
+sniffio>=1.3.0                # async library detection
+click>=8.0.0                  # dependency uvicorn
+h11>=0.14.0                   # HTTP/1.1 support uvicorn
+
+# ── SSH ───────────────────────────────────────────────────────
+paramiko>=3.0.0               # SSH client untuk reboot device
+cryptography>=41.0.0          # dependency paramiko
+bcrypt>=4.0.0                 # dependency paramiko
+cffi>=1.15.0                  # dependency cryptography
+pycparser>=2.21               # dependency cffi
+
+# ── Supabase Backup ───────────────────────────────────────────
+supabase>=2.0.0               # Supabase Python client
+gotrue>=2.0.0                 # Supabase auth
+postgrest>=0.16.0             # Supabase REST client
+realtime>=2.0.0               # Supabase realtime
+storage3>=0.7.0               # Supabase storage
+httpx>=0.25.0                 # HTTP client (dependency supabase)
+httpcore>=1.0.0               # dependency httpx
+certifi>=2023.0.0             # SSL certificates
+idna>=3.4                     # internationalized domain names
+charset-normalizer>=3.0.0     # character encoding
+typing_extensions>=4.6.0      # type hints backport
+annotated-types>=0.5.0        # dependency pydantic
