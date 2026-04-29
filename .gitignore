@@ -1,0 +1,53 @@
+# Environment variables 
+.env
+.env.*
+*.env
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Log files
+logs/
+*.log
+
+# Buffer data (temporary saat DB down)
+buffer_data/
+
+# Export CSV
+exports/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# Database lokal
+*.db
+*.sqlite3
+
+# Cloudflared credentials
+*.json
+cert.pem
+~/.cloudflared/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains
+.idea/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
