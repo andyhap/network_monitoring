@@ -48,10 +48,5 @@ def main():
 
         time.sleep(1)
 
-    # rolling backup ke Supabase 60 menit
-    # backup_interval = 60  # setiap 60 menit
-    # schedule.every(backup_interval).minutes.do(supabase_backup.run)
-    # logger.info(f"Backup scheduler aktif — interval: {backup_interval} menit")
-
 if __name__ == '__main__':
     main()
