@@ -85,7 +85,7 @@ def backup_and_cleanup_table(
             backed_up += len(batch)
         except Exception as e:
             logger.error(f"Gagal upload batch ke {supabase_table}: {e}")
-            # Jangan hapus lokal kalau upload gagal
+            # data lokal tidak akan dihapus jika gagal
             session.rollback()
             return backed_up, 0
 

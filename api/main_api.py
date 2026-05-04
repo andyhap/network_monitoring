@@ -2,13 +2,14 @@ import paramiko
 import icmplib
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from utils.logger import get_logger
-# from models.database import get_session, DeviceStatus, Device, get_active_devices
 from models.database import get_session, DeviceStatus, Device, get_active_devices, SnmpMetric, InterfaceTraffic
+from backup.supabase_backup import run as run_supabase_backup
+import asyncio
 
 load_dotenv()
 logger = get_logger('api')
@@ -489,3 +490,32 @@ def delete_device(device_id: int):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         session.close()
+
+# ── Backup Endpoints ─────────────────────────────────────────
+
+async def execute_background_backup():
+    try:
+        logger.info("[API] Memulai proses backup manual ke Supabase...")
+        # Panggil fungsi yang sudah di-import tadi
+        await asyncio.to_thread(run_supabase_backup)
+        logger.info("[API] Backup manual ke Supabase berhasil diselesaikan!")
+    except Exception as e:
+        logger.error(f"[API] Proses backup gagal di background: {str(e)}")
+
+@app.post("/api/backup/manual")
+def trigger_manual_backup(background_tasks: BackgroundTasks):
+    """Memicu backup database manual ke Supabase via background task"""
+    try:
+        background_tasks.add_task(execute_background_backup)
+        
+        return {
+            "status": "accepted",
+            "message": "Backup akan dilakukan di background. Cek log untuk hasilnya.",
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"[API] Gagal memicu endpoint backup: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Terjadi kesalahan internal server saat memicu backup: {str(e)}"
+        )
