@@ -1,24 +1,23 @@
-import os
 import paramiko
 import icmplib
 from datetime import datetime
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from utils.logger import get_logger
-from models.database import get_session, DeviceStatus
+from models.database import get_session, DeviceStatus, Device, get_active_devices
 
 load_dotenv()
 logger = get_logger('api')
 
 app = FastAPI(
     title="Network Monitoring API",
-    description="API untuk monitoring jaringan — reboot device & ping",
-    version="1.0.0"
+    description="API untuk monitoring jaringan — dynamic device management",
+    version="2.0.0"
 )
 
-# CORS agar Laravel bisa akses
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,59 +25,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Konfigurasi device ───────────────────────────────────────
-DEVICES = {
-    'main-router': {
-        'ip':       os.getenv('MAIN_ROUTER_IP'),
-        'mgmt_ip':  os.getenv('MAIN_ROUTER_IP'),
-        'ssh_user': os.getenv('MAIN_ROUTER_SSH_USER', 'admin'),
-        'ssh_pass': os.getenv('MAIN_ROUTER_SSH_PASS', ''),
-        'type':     'mikrotik',
-    },
-    'router-kantor': {
-        'ip':       os.getenv('ROUTER_KANTOR_IP'),
-        'mgmt_ip':  os.getenv('ROUTER_KANTOR_IP'),
-        'ssh_user': os.getenv('ROUTER_KANTOR_SSH_USER', 'admin'),
-        'ssh_pass': os.getenv('ROUTER_KANTOR_SSH_PASS', ''),
-        'type':     'mikrotik',
-    },
-    'openwrt': {
-        'ip':       os.getenv('OPENWRT_IP'),
-        'mgmt_ip':  os.getenv('OPENWRT_IP'),
-        'ssh_user': os.getenv('OPENWRT_SSH_USER', 'root'),
-        'ssh_pass': os.getenv('OPENWRT_SSH_PASS', ''),
-        'type':     'openwrt',
-    },
-        'router-test': {
-        'ip':       os.getenv('ROUTER_TEST_IP'),
-        'mgmt_ip':  os.getenv('ROUTER_TEST_IP'),
-        'ssh_user': os.getenv('ROUTER_TEST_SSH_USER', 'admin'),
-        'ssh_pass': os.getenv('ROUTER_TEST_SSH_PASS', ''),
-        'type':     'mikrotik',
-    },
-}
-
-# Reboot command per device type
 REBOOT_COMMANDS = {
     'mikrotik': '/system reboot',
     'openwrt':  'reboot',
+    'linux':    'sudo reboot',
 }
+
 
 # ── Helper SSH ───────────────────────────────────────────────
 
-def ssh_execute(host: str, user: str, password: str, command: str, timeout: int = 10) -> dict:
-    """Eksekusi command via SSH, return output dan status"""
+def ssh_execute(host, user, password, command, timeout=10):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(
-            hostname=host,
-            username=user,
-            password=password,
-            timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False
-        )
+        client.connect(hostname=host, username=user, password=password,
+                       timeout=timeout, look_for_keys=False, allow_agent=False)
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         out = stdout.read().decode('utf-8', errors='ignore').strip()
         err = stderr.read().decode('utf-8', errors='ignore').strip()
@@ -92,32 +53,67 @@ def ssh_execute(host: str, user: str, password: str, command: str, timeout: int 
     finally:
         client.close()
 
-# ── Models ───────────────────────────────────────────────────
 
-class RebootRequest(BaseModel):
-    device: str  # main-router / router-kantor / openwrt
+def get_device_or_404(name: str) -> Device:
+    """Ambil device aktif dari DB, raise 404 jika tidak ada"""
+    session = get_session()
+    try:
+        device = session.query(Device).filter(
+            Device.name == name,
+            Device.is_active == 1
+        ).first()
+        if not device:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Device '{name}' tidak ditemukan atau nonaktif"
+            )
+        return {
+            'name':      device.name,
+            'ip':        device.ip_address,
+            'type':      device.type,
+            'ssh_user':  device.ssh_user,
+            'ssh_pass':  device.ssh_pass,
+        }
+    finally:
+        session.close()
+
+
+# ── Pydantic Models ──────────────────────────────────────────
 
 class PingRequest(BaseModel):
-    device: str  # main-router / router-kantor / openwrt
+    device: str
 
-# ── Endpoints ────────────────────────────────────────────────
+class RebootRequest(BaseModel):
+    device: str
+
+class DeviceCreate(BaseModel):
+    name:           str
+    ip_address:     str
+    type:           str
+    ssh_user:       str = 'admin'
+    ssh_pass:       str = ''
+    snmp_community: str = 'public'
+    description:    str = ''
+
+class DeviceUpdate(BaseModel):
+    ip_address:     Optional[str] = None
+    type:           Optional[str] = None
+    ssh_user:       Optional[str] = None
+    ssh_pass:       Optional[str] = None
+    snmp_community: Optional[str] = None
+    description:    Optional[str] = None
+    is_active:      Optional[int] = None
+
+
+# ── Info Endpoints ───────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {
         "service": "Network Monitoring API",
+        "version": "2.0.0",
         "status":  "running",
         "time":    datetime.now().isoformat()
-    }
-
-@app.get("/devices")
-def list_devices():
-    """Daftar semua device yang terdaftar"""
-    return {
-        "devices": [
-            {"name": name, "ip": cfg["mgmt_ip"], "type": cfg["type"]}
-            for name, cfg in DEVICES.items()
-        ]
     }
 
 @app.get("/status")
@@ -139,16 +135,13 @@ def get_all_status():
         )
         return {
             "status": "ok",
-            "data": [
-                {
-                    "device":     r.device,
-                    "ip_address": r.ip_address,
-                    "status":     r.status,
-                    "latency_ms": r.latency_ms,
-                    "checked_at": r.checked_at.isoformat(),
-                }
-                for r in records
-            ]
+            "data": [{
+                "device":     r.device,
+                "ip_address": r.ip_address,
+                "status":     r.status,
+                "latency_ms": r.latency_ms,
+                "checked_at": r.checked_at.isoformat(),
+            } for r in records]
         }
     finally:
         session.close()
@@ -156,9 +149,6 @@ def get_all_status():
 @app.get("/status/{device_name}")
 def get_device_status(device_name: str):
     """Status terbaru satu device"""
-    if device_name not in DEVICES:
-        raise HTTPException(status_code=404, detail=f"Device '{device_name}' tidak ditemukan")
-
     session = get_session()
     try:
         record = (
@@ -173,24 +163,21 @@ def get_device_status(device_name: str):
             "status":     "ok",
             "device":     record.device,
             "ip_address": record.ip_address,
-            "status":     record.status,
+            "ping_status": record.status,
             "latency_ms": record.latency_ms,
             "checked_at": record.checked_at.isoformat(),
         }
     finally:
         session.close()
 
+
+# ── Action Endpoints ─────────────────────────────────────────
+
 @app.post("/ping")
 def ping_now(req: PingRequest):
-    """
-    Trigger ping manual ke device tertentu.
-    Simpan hasilnya ke DB dan return langsung ke Laravel.
-    """
-    if req.device not in DEVICES:
-        raise HTTPException(status_code=404, detail=f"Device '{req.device}' tidak ditemukan")
-
-    cfg = DEVICES[req.device]
-    ip  = cfg['mgmt_ip']
+    """Ping manual ke device, simpan ke DB, return hasil"""
+    device = get_device_or_404(req.device)
+    ip     = device['ip']
 
     try:
         host    = icmplib.ping(ip, count=4, interval=0.5, timeout=2, privileged=False)
@@ -200,29 +187,25 @@ def ping_now(req: PingRequest):
         status, latency = 'down', None
         logger.error(f"Ping error {req.device}: {e}")
 
-    # Simpan ke DB
     session = get_session()
     try:
         session.add(DeviceStatus(
-            device=req.device,
-            ip_address=ip,
-            status=status,
-            latency_ms=latency,
+            device=req.device, ip_address=ip,
+            status=status, latency_ms=latency,
             checked_at=datetime.now()
         ))
         session.commit()
     except Exception as e:
         session.rollback()
-        logger.error(f"DB error saat simpan ping {req.device}: {e}")
+        logger.error(f"DB error ping {req.device}: {e}")
     finally:
         session.close()
 
     logger.info(f"[API] Ping {req.device} ({ip}) — {status.upper()} | {latency} ms")
-
     return {
-        "status":     "ok",
-        "device":     req.device,
-        "ip_address": ip,
+        "status":      "ok",
+        "device":      req.device,
+        "ip_address":  ip,
         "ping_result": status,
         "latency_ms":  latency,
         "checked_at":  datetime.now().isoformat(),
@@ -230,37 +213,23 @@ def ping_now(req: PingRequest):
 
 @app.post("/reboot")
 def reboot_device(req: RebootRequest):
-    """
-    Kirim command reboot ke device via SSH.
-    Device akan disconnect setelah reboot — itu normal.
-    """
-    if req.device not in DEVICES:
-        raise HTTPException(status_code=404, detail=f"Device '{req.device}' tidak ditemukan")
-
-    cfg     = DEVICES[req.device]
-    ip      = cfg['mgmt_ip']
-    user    = cfg['ssh_user']
-    passwd  = cfg['ssh_pass']
-    cmd     = REBOOT_COMMANDS[cfg['type']]
+    """Reboot device via SSH — credentials dari DB"""
+    device = get_device_or_404(req.device)
+    ip     = device['ip']
+    user   = device['ssh_user']
+    passwd = device['ssh_pass']
+    cmd    = REBOOT_COMMANDS.get(device['type'], 'reboot')
 
     logger.info(f"[API] Reboot request: {req.device} ({ip})")
-
     result = ssh_execute(ip, user, passwd, cmd, timeout=10)
 
-    # Reboot MikroTik akan disconnect SSH — itu expected, bukan error
     if not result['success']:
-        # Kalau error-nya bukan karena koneksi terputus saat reboot
-        if 'Connection reset' not in result['error'] and \
-           'EOF' not in result['error'] and \
-           'timed out' not in result['error'].lower():
-            logger.error(f"Reboot gagal {req.device}: {result['error']}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Reboot gagal: {result['error']}"
-            )
+        err = result['error']
+        if not any(x in err for x in ['Connection reset', 'EOF', 'timed out']):
+            logger.error(f"Reboot gagal {req.device}: {err}")
+            raise HTTPException(status_code=500, detail=f"Reboot gagal: {err}")
 
     logger.info(f"[API] Reboot command terkirim ke {req.device}")
-
     return {
         "status":  "ok",
         "device":  req.device,
@@ -268,3 +237,130 @@ def reboot_device(req: RebootRequest):
         "note":    "Device akan restart dalam beberapa detik",
         "sent_at": datetime.now().isoformat(),
     }
+
+
+# ── Device CRUD Endpoints ────────────────────────────────────
+
+@app.get("/api/devices")
+def list_devices():
+    """List semua device (aktif dan nonaktif)"""
+    session = get_session()
+    try:
+        devices = session.query(Device).order_by(Device.id).all()
+        return {
+            "status": "ok",
+            "data": [{
+                "id":          d.id,
+                "name":        d.name,
+                "ip_address":  d.ip_address,
+                "type":        d.type,
+                "ssh_user":    d.ssh_user,
+                "snmp_community": d.snmp_community,
+                "is_active":   d.is_active,
+                "description": d.description,
+                "created_at":  d.created_at.isoformat(),
+            } for d in devices]
+        }
+    finally:
+        session.close()
+
+@app.post("/api/devices")
+def create_device(req: DeviceCreate):
+    """Tambah device baru — langsung dimonitor pada siklus berikutnya"""
+    session = get_session()
+    try:
+        existing = session.query(Device).filter(Device.name == req.name).first()
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Device '{req.name}' sudah ada")
+
+        device = Device(
+            name=req.name, ip_address=req.ip_address,
+            type=req.type, ssh_user=req.ssh_user,
+            ssh_pass=req.ssh_pass, snmp_community=req.snmp_community,
+            description=req.description, is_active=1
+        )
+        session.add(device)
+        session.commit()
+        logger.info(f"[API] Device ditambahkan: {req.name} ({req.ip_address})")
+        return {
+            "status":  "ok",
+            "message": f"Device '{req.name}' berhasil ditambahkan",
+            "id":      device.id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+@app.put("/api/devices/{device_id}")
+def update_device(device_id: int, req: DeviceUpdate):
+    """Update detail device"""
+    session = get_session()
+    try:
+        device = session.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            raise HTTPException(status_code=404, detail="Device tidak ditemukan")
+
+        for field, value in req.dict(exclude_none=True).items():
+            setattr(device, field, value)
+        session.commit()
+        logger.info(f"[API] Device diupdate: {device.name}")
+        return {"status": "ok", "message": f"Device '{device.name}' berhasil diupdate"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+@app.patch("/api/devices/{device_id}/toggle")
+def toggle_device(device_id: int):
+    """Toggle aktif/nonaktif device"""
+    session = get_session()
+    try:
+        device = session.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            raise HTTPException(status_code=404, detail="Device tidak ditemukan")
+
+        device.is_active = 0 if device.is_active == 1 else 1
+        session.commit()
+        status = "diaktifkan" if device.is_active == 1 else "dinonaktifkan"
+        logger.info(f"[API] Device {device.name} {status}")
+        return {
+            "status":    "ok",
+            "message":   f"Device '{device.name}' {status}",
+            "is_active": device.is_active
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+@app.delete("/api/devices/{device_id}")
+def delete_device(device_id: int):
+    """Hapus device permanen"""
+    session = get_session()
+    try:
+        device = session.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            raise HTTPException(status_code=404, detail="Device tidak ditemukan")
+
+        name = device.name
+        session.delete(device)
+        session.commit()
+        logger.info(f"[API] Device dihapus: {name}")
+        return {"status": "ok", "message": f"Device '{name}' berhasil dihapus"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()

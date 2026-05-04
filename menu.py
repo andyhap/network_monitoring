@@ -429,6 +429,206 @@ def _export_csv_supabase(pilih: str, export_dir: str, timestamp: str):
         print(f"\n  Error koneksi Supabase: {e}")
     pause()
 
+# ── Menu 7 — Manajemen Device ────────────────────────────────
+
+def menu_device():
+    while True:
+        clear()
+        header("MANAJEMEN DEVICE")
+        print()
+        print("  [1] Lihat semua device")
+        print("  [2] Tambah device baru")
+        print("  [3] Toggle aktif / nonaktif")
+        print("  [4] Hapus device permanen")
+        print("  [0] Kembali")
+        print()
+        pilih = input("Pilih: ").strip()
+
+        if   pilih == '0': break
+        elif pilih == '1': _device_list()
+        elif pilih == '2': _device_add()
+        elif pilih == '3': _device_toggle()
+        elif pilih == '4': _device_delete()
+        else:
+            print("  Pilihan tidak valid.")
+            pause()
+
+
+def _device_list():
+    clear()
+    header("DAFTAR SEMUA DEVICE")
+    from models.database import Device
+    session = get_session()
+    try:
+        devices = session.query(Device).order_by(Device.id).all()
+        if not devices:
+            print("\n  Belum ada device terdaftar.")
+        else:
+            print()
+            print_table(
+                ['ID', 'Nama', 'IP', 'Tipe', 'SNMP', 'Status', 'Keterangan'],
+                [[d.id, d.name, d.ip_address, d.type,
+                  d.snmp_community,
+                  'AKTIF' if d.is_active else 'NONAKTIF',
+                  d.description or '-']
+                 for d in devices],
+                [4, 16, 16, 10, 8, 10, 20]
+            )
+    finally:
+        session.close()
+    pause()
+
+
+def _device_list_simple():
+    from models.database import Device
+    session = get_session()
+    try:
+        devices = session.query(Device).order_by(Device.id).all()
+        print_table(
+            ['ID', 'Nama', 'IP', 'Status'],
+            [[d.id, d.name, d.ip_address,
+              'AKTIF' if d.is_active else 'NONAKTIF']
+             for d in devices],
+            [4, 18, 18, 10]
+        )
+    finally:
+        session.close()
+
+
+def _device_add():
+    clear()
+    header("TAMBAH DEVICE BARU")
+    print()
+    name      = input("  Nama device (contoh: router-baru)  : ").strip()
+    ip        = input("  IP address                         : ").strip()
+    dtype     = input("  Tipe [mikrotik/openwrt/linux]      : ").strip()
+    ssh_user  = input("  SSH user        (default: admin)   : ").strip() or 'admin'
+    ssh_pass  = input("  SSH password    (kosong = tidak ada): ").strip()
+    community = input("  SNMP community  (default: public)  : ").strip() or 'public'
+    desc      = input("  Deskripsi                          : ").strip()
+
+    if not name or not ip or not dtype:
+        print("\n  Error: nama, IP, dan tipe wajib diisi!")
+        pause()
+        return
+
+    if dtype not in ('mikrotik', 'openwrt', 'linux'):
+        print("\n  Error: tipe harus mikrotik, openwrt, atau linux!")
+        pause()
+        return
+
+    from models.database import Device
+    session = get_session()
+    try:
+        existing = session.query(Device).filter(Device.name == name).first()
+        if existing:
+            print(f"\n  Error: device '{name}' sudah ada!")
+            pause()
+            return
+
+        device = Device(
+            name=name, ip_address=ip, type=dtype,
+            ssh_user=ssh_user, ssh_pass=ssh_pass,
+            snmp_community=community, description=desc,
+            is_active=1
+        )
+        session.add(device)
+        session.commit()
+        print(f"\n  ✓ Device '{name}' ({ip}) berhasil ditambahkan!")
+        print("    Monitoring akan mulai pada siklus berikutnya.")
+    except Exception as e:
+        session.rollback()
+        print(f"\n  Error: {e}")
+    finally:
+        session.close()
+    pause()
+
+
+def _device_toggle():
+    clear()
+    header("TOGGLE AKTIF / NONAKTIF DEVICE")
+    print()
+    _device_list_simple()
+    print()
+    try:
+        device_id = int(input("  Masukkan ID device: ").strip())
+    except ValueError:
+        print("  ID tidak valid.")
+        pause()
+        return
+
+    from models.database import Device
+    session = get_session()
+    try:
+        device = session.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            print(f"\n  Device ID {device_id} tidak ditemukan!")
+            pause()
+            return
+
+        device.is_active = 0 if device.is_active == 1 else 1
+        session.commit()
+        status = "DIAKTIFKAN" if device.is_active == 1 else "DINONAKTIFKAN"
+        print(f"\n  ✓ Device '{device.name}' berhasil {status}!")
+        if device.is_active == 0:
+            print("    Monitoring akan berhenti pada siklus berikutnya.")
+        else:
+            print("    Monitoring akan mulai pada siklus berikutnya.")
+    except Exception as e:
+        session.rollback()
+        print(f"\n  Error: {e}")
+    finally:
+        session.close()
+    pause()
+
+
+def _device_delete():
+    clear()
+    header("HAPUS DEVICE PERMANEN")
+    print()
+    print("  PERINGATAN: Device akan dihapus dari daftar monitoring.")
+    print("  Data historis di database TIDAK ikut dihapus.")
+    print()
+    _device_list_simple()
+    print()
+    try:
+        device_id = int(input("  Masukkan ID device yang akan dihapus: ").strip())
+    except ValueError:
+        print("  ID tidak valid.")
+        pause()
+        return
+
+    from models.database import Device
+    session = get_session()
+    try:
+        device = session.query(Device).filter(Device.id == device_id).first()
+        if not device:
+            print(f"\n  Device ID {device_id} tidak ditemukan!")
+            pause()
+            return
+
+        konfirmasi = input(
+            f"\n  Hapus '{device.name}' ({device.ip_address})? "
+            f"(ketik 'ya' untuk konfirmasi): "
+        ).strip()
+
+        if konfirmasi.lower() != 'ya':
+            print("  Dibatalkan.")
+            pause()
+            return
+
+        name = device.name
+        session.delete(device)
+        session.commit()
+        print(f"\n  ✓ Device '{name}' berhasil dihapus permanen!")
+        print("    Monitoring akan berhenti pada siklus berikutnya.")
+    except Exception as e:
+        session.rollback()
+        print(f"\n  Error: {e}")
+    finally:
+        session.close()
+    pause()
+
 # ── Main Menu ────────────────────────────────────────────────
 
 def main():
@@ -445,6 +645,7 @@ def main():
         print("  [4] Backup manual ke Supabase")
         print("  [5] Statistik database")
         print("  [6] Export data ke CSV")
+        print("  [7] Manajemen device")
         print("  [0] Keluar")
         print("=" * 52)
         pilih = input("Pilih menu: ").strip()
@@ -455,6 +656,7 @@ def main():
         elif pilih == '4': menu_backup_manual()
         elif pilih == '5': menu_statistik()
         elif pilih == '6': menu_export_csv()
+        elif pilih == '7': menu_device()
         elif pilih == '0':
             print("\n  Keluar dari menu. Monitoring tetap berjalan.\n")
             sys.exit(0)
