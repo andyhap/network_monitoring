@@ -37,7 +37,7 @@ def check_device(device: dict):
         # Simpan packetLoss ke snmp_metrics agar terbaca Laravel
         session.add(SnmpMetric(
             device=name, ip_address=ip,
-            metric_name='packetLoss',
+            metric_name='packet_loss',
             metric_value=str(packet_loss),
             collected_at=now
         ))
