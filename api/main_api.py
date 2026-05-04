@@ -7,7 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from utils.logger import get_logger
-from models.database import get_session, DeviceStatus, Device, get_active_devices
+# from models.database import get_session, DeviceStatus, Device, get_active_devices
+from models.database import get_session, DeviceStatus, Device, get_active_devices, SnmpMetric, InterfaceTraffic
 
 load_dotenv()
 logger = get_logger('api')
@@ -345,18 +346,142 @@ def toggle_device(device_id: int):
 
 @app.delete("/api/devices/{device_id}")
 def delete_device(device_id: int):
-    """Hapus device permanen"""
+    """
+    Hapus device permanen:
+    1. Archive semua data monitoring ke Supabase (deleted_* tables)
+    2. Hapus semua data monitoring dari DB lokal
+    3. Hapus device dari tabel devices
+    """
     session = get_session()
     try:
         device = session.query(Device).filter(Device.id == device_id).first()
         if not device:
             raise HTTPException(status_code=404, detail="Device tidak ditemukan")
 
-        name = device.name
+        name       = device.name
+        ip_address = device.ip_address
+
+        # Info device untuk disimpan sebagai metadata di archive
+        device_info = {
+            'id':             device.id,
+            'name':           device.name,
+            'ip_address':     device.ip_address,
+            'type':           device.type,
+            'ssh_user':       device.ssh_user,
+            'snmp_community': device.snmp_community,
+            'description':    device.description,
+            'created_at':     device.created_at.isoformat(),
+        }
+
+        logger.info(f"[API] Mulai archive & hapus device: {name} ({ip_address})")
+
+        # ── Step 1: Archive ke Supabase ──────────────────────
+        try:
+            from backup.supabase_backup import get_supabase_client
+            client = get_supabase_client()
+            now    = datetime.now().isoformat()
+
+            # Archive device_status
+            ds_records = session.query(DeviceStatus).filter(
+                DeviceStatus.device == name
+            ).all()
+            if ds_records:
+                client.table('deleted_device_status').insert([{
+                    'device':      r.device,
+                    'ip_address':  r.ip_address,
+                    'status':      r.status,
+                    'latency_ms':  r.latency_ms,
+                    'checked_at':  r.checked_at.isoformat(),
+                    'deleted_at':  now,
+                    'device_info': device_info,
+                } for r in ds_records]).execute()
+                logger.info(f"[API] Archive {len(ds_records)} device_status records → Supabase")
+
+            # Archive snmp_metrics
+            sm_records = session.query(SnmpMetric).filter(
+                SnmpMetric.device == name
+            ).all()
+            if sm_records:
+                # Batch 500 agar tidak timeout
+                for i in range(0, len(sm_records), 500):
+                    batch = sm_records[i:i+500]
+                    client.table('deleted_snmp_metrics').insert([{
+                        'device':       r.device,
+                        'ip_address':   r.ip_address,
+                        'metric_name':  r.metric_name,
+                        'metric_value': r.metric_value,
+                        'collected_at': r.collected_at.isoformat(),
+                        'deleted_at':   now,
+                        'device_info':  device_info,
+                    } for r in batch]).execute()
+                logger.info(f"[API] Archive {len(sm_records)} snmp_metrics records → Supabase")
+
+            # Archive interface_traffic
+            it_records = session.query(InterfaceTraffic).filter(
+                InterfaceTraffic.device == name
+            ).all()
+            if it_records:
+                for i in range(0, len(it_records), 500):
+                    batch = it_records[i:i+500]
+                    client.table('deleted_interface_traffic').insert([{
+                        'device':          r.device,
+                        'ip_address':      r.ip_address,
+                        'interface_name':  r.interface_name,
+                        'bytes_in':        r.bytes_in,
+                        'bytes_out':       r.bytes_out,
+                        'packets_in':      r.packets_in,
+                        'packets_out':     r.packets_out,
+                        'collected_at':    r.collected_at.isoformat(),
+                        'deleted_at':      now,
+                        'device_info':     device_info,
+                    } for r in batch]).execute()
+                logger.info(f"[API] Archive {len(it_records)} interface_traffic records → Supabase")
+
+        except Exception as e:
+            logger.error(f"[API] Gagal archive ke Supabase: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gagal archive data ke Supabase sebelum hapus: {e}"
+            )
+
+        # ── Step 2: Hapus semua data monitoring dari lokal ───
+        ds_deleted = session.query(DeviceStatus).filter(
+            DeviceStatus.device == name
+        ).delete()
+
+        sm_deleted = session.query(SnmpMetric).filter(
+            SnmpMetric.device == name
+        ).delete()
+
+        it_deleted = session.query(InterfaceTraffic).filter(
+            InterfaceTraffic.device == name
+        ).delete()
+
+        # ── Step 3: Hapus device ─────────────────────────────
         session.delete(device)
         session.commit()
-        logger.info(f"[API] Device dihapus: {name}")
-        return {"status": "ok", "message": f"Device '{name}' berhasil dihapus"}
+
+        logger.info(
+            f"[API] Device '{name}' dihapus. "
+            f"Data dihapus: {ds_deleted} status, "
+            f"{sm_deleted} snmp, {it_deleted} traffic"
+        )
+
+        return {
+            "status":  "ok",
+            "message": f"Device '{name}' berhasil dihapus beserta semua datanya",
+            "archived": {
+                "device_status":     len(ds_records) if ds_records else 0,
+                "snmp_metrics":      len(sm_records) if sm_records else 0,
+                "interface_traffic": len(it_records) if it_records else 0,
+            },
+            "deleted_from_local": {
+                "device_status":     ds_deleted,
+                "snmp_metrics":      sm_deleted,
+                "interface_traffic": it_deleted,
+            }
+        }
+
     except HTTPException:
         raise
     except Exception as e:

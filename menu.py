@@ -586,8 +586,10 @@ def _device_delete():
     clear()
     header("HAPUS DEVICE PERMANEN")
     print()
-    print("  PERINGATAN: Device akan dihapus dari daftar monitoring.")
-    print("  Data historis di database TIDAK ikut dihapus.")
+    print("  PERINGATAN: Semua data monitoring device akan:")
+    print("  1. Di-archive ke Supabase (deleted_* tables)")
+    print("  2. Dihapus dari database lokal")
+    print("  3. Device dihapus dari daftar monitoring")
     print()
     _device_list_simple()
     print()
@@ -598,7 +600,8 @@ def _device_delete():
         pause()
         return
 
-    from models.database import Device
+    from models.database import Device, DeviceStatus, SnmpMetric, InterfaceTraffic
+    from backup.supabase_backup import get_supabase_client
     session = get_session()
     try:
         device = session.query(Device).filter(Device.id == device_id).first()
@@ -607,21 +610,84 @@ def _device_delete():
             pause()
             return
 
-        konfirmasi = input(
-            f"\n  Hapus '{device.name}' ({device.ip_address})? "
-            f"(ketik 'ya' untuk konfirmasi): "
-        ).strip()
+        # Hitung jumlah data
+        ds_count = session.query(DeviceStatus).filter(DeviceStatus.device == device.name).count()
+        sm_count = session.query(SnmpMetric).filter(SnmpMetric.device == device.name).count()
+        it_count = session.query(InterfaceTraffic).filter(InterfaceTraffic.device == device.name).count()
 
+        print(f"\n  Device  : {device.name} ({device.ip_address})")
+        print(f"  Data yang akan di-archive & dihapus:")
+        print(f"    device_status     : {ds_count} records")
+        print(f"    snmp_metrics      : {sm_count} records")
+        print(f"    interface_traffic : {it_count} records")
+        print()
+
+        konfirmasi = input("  Ketik 'ya' untuk konfirmasi: ").strip()
         if konfirmasi.lower() != 'ya':
             print("  Dibatalkan.")
             pause()
             return
 
         name = device.name
+        now  = datetime.now().isoformat()
+        device_info = {
+            'id': device.id, 'name': device.name,
+            'ip_address': device.ip_address, 'type': device.type,
+        }
+
+        print(f"\n  Mengarchive data ke Supabase...")
+        client = get_supabase_client()
+
+        # Archive device_status
+        ds_records = session.query(DeviceStatus).filter(DeviceStatus.device == name).all()
+        if ds_records:
+            client.table('deleted_device_status').insert([{
+                'device': r.device, 'ip_address': r.ip_address,
+                'status': r.status, 'latency_ms': r.latency_ms,
+                'checked_at': r.checked_at.isoformat(),
+                'deleted_at': now, 'device_info': device_info,
+            } for r in ds_records]).execute()
+            print(f"  ✓ Archive {len(ds_records)} device_status records")
+
+        # Archive snmp_metrics
+        sm_records = session.query(SnmpMetric).filter(SnmpMetric.device == name).all()
+        if sm_records:
+            for i in range(0, len(sm_records), 500):
+                batch = sm_records[i:i+500]
+                client.table('deleted_snmp_metrics').insert([{
+                    'device': r.device, 'ip_address': r.ip_address,
+                    'metric_name': r.metric_name, 'metric_value': r.metric_value,
+                    'collected_at': r.collected_at.isoformat(),
+                    'deleted_at': now, 'device_info': device_info,
+                } for r in batch]).execute()
+            print(f"  ✓ Archive {len(sm_records)} snmp_metrics records")
+
+        # Archive interface_traffic
+        it_records = session.query(InterfaceTraffic).filter(InterfaceTraffic.device == name).all()
+        if it_records:
+            for i in range(0, len(it_records), 500):
+                batch = it_records[i:i+500]
+                client.table('deleted_interface_traffic').insert([{
+                    'device': r.device, 'ip_address': r.ip_address,
+                    'interface_name': r.interface_name,
+                    'bytes_in': r.bytes_in, 'bytes_out': r.bytes_out,
+                    'packets_in': r.packets_in, 'packets_out': r.packets_out,
+                    'collected_at': r.collected_at.isoformat(),
+                    'deleted_at': now, 'device_info': device_info,
+                } for r in batch]).execute()
+            print(f"  ✓ Archive {len(it_records)} interface_traffic records")
+
+        # Hapus dari lokal
+        print(f"\n  Menghapus data dari database lokal...")
+        session.query(DeviceStatus).filter(DeviceStatus.device == name).delete()
+        session.query(SnmpMetric).filter(SnmpMetric.device == name).delete()
+        session.query(InterfaceTraffic).filter(InterfaceTraffic.device == name).delete()
         session.delete(device)
         session.commit()
-        print(f"\n  ✓ Device '{name}' berhasil dihapus permanen!")
-        print("    Monitoring akan berhenti pada siklus berikutnya.")
+
+        print(f"  ✓ Device '{name}' dan semua datanya berhasil dihapus!")
+        print(f"  ✓ Data tersimpan di Supabase (deleted_* tables)")
+
     except Exception as e:
         session.rollback()
         print(f"\n  Error: {e}")
