@@ -14,6 +14,21 @@ OIDS = {
     'totalInterfaces': '1.3.6.1.2.1.2.1.0',
 }
 
+# OID MAC address interface pertama (biasanya ether1/eth0)
+OID_IF_MAC = '1.3.6.1.2.1.2.2.1.6.2'  # ifPhysAddress index 2 (skip loopback)
+
+
+def format_mac(raw_value: str) -> str:
+    """Konversi raw bytes MAC address ke format XX:XX:XX:XX:XX:XX"""
+    try:
+        # easysnmp return MAC sebagai string bytes
+        mac_bytes = [f"{ord(c):02X}" for c in raw_value]
+        if len(mac_bytes) == 6:
+            return ':'.join(mac_bytes)
+    except Exception:
+        pass
+    return raw_value
+
 
 def poll_device(device: dict):
     name      = device['name']
@@ -26,6 +41,9 @@ def poll_device(device: dict):
             version=2, remote_port=161, timeout=5, retries=2
         )
         db_session = get_session()
+        now = datetime.now()
+
+        # Poll OID standar
         for metric_name, oid in OIDS.items():
             try:
                 result = snmp_session.get(oid)
@@ -34,10 +52,34 @@ def poll_device(device: dict):
                 db_session.add(SnmpMetric(
                     device=name, ip_address=ip,
                     metric_name=metric_name, metric_value=value,
-                    collected_at=datetime.now()
+                    collected_at=now
                 ))
             except EasySNMPError as e:
                 logger.warning(f"{name} | {metric_name} gagal: {e}")
+
+        # Poll MAC address
+        try:
+            mac_result = snmp_session.get(OID_IF_MAC)
+            mac_value  = format_mac(mac_result.value)
+            logger.info(f"{name} | macAddress: {mac_value}")
+            db_session.add(SnmpMetric(
+                device=name, ip_address=ip,
+                metric_name='macAddress',
+                metric_value=mac_value,
+                collected_at=now
+            ))
+        except EasySNMPError as e:
+            logger.warning(f"{name} | macAddress gagal: {e}")
+
+        # Simpan monitoringInterval (dari .env / config)
+        import os
+        interval = os.getenv('PING_INTERVAL', '30')
+        db_session.add(SnmpMetric(
+            device=name, ip_address=ip,
+            metric_name='monitoringInterval',
+            metric_value=f"{interval} Seconds",
+            collected_at=now
+        ))
 
         db_session.commit()
         db_session.close()
