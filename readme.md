@@ -1,6 +1,6 @@
 # 🖥️ Network Monitoring — Python
 
-Sistem monitoring jaringan berbasis Python untuk simulasi jaringan menggunakan GNS3 + VirtualBox. Memonitor status perangkat, traffic bandwidth, dan metrics SNMP secara realtime dengan backup otomatis ke Supabase.
+Sistem monitoring jaringan berbasis Python untuk simulasi jaringan menggunakan GNS3 + VirtualBox. Memonitor status perangkat, traffic bandwidth, dan metrics SNMP secara realtime dengan manajemen device dinamis dari database dan backup otomatis ke Supabase.
 
 ---
 
@@ -12,6 +12,7 @@ Sistem monitoring jaringan berbasis Python untuk simulasi jaringan menggunakan G
 - [Struktur Project](#struktur-project)
 - [Instalasi](#instalasi)
 - [Konfigurasi](#konfigurasi)
+- [Migrasi Database](#migrasi-database)
 - [Menjalankan Program](#menjalankan-program)
 - [API Endpoints](#api-endpoints)
 - [Menu CLI](#menu-cli)
@@ -32,12 +33,22 @@ Cloudflare Zero Trust Tunnel
 
 Laravel (hosting terpisah)
     └── hit API via HTTPS → monitoring.domain.com
-    └── baca histori      → Supabase
+        ├── GET  /status              → status semua device
+        ├── POST /ping                → ping manual
+        ├── POST /reboot              → reboot device via SSH
+        ├── GET  /api/devices         → list device dari DB
+        ├── POST /api/devices         → tambah device baru
+        ├── PUT  /api/devices/{id}    → update device
+        ├── PATCH /api/devices/{id}/toggle → aktif/nonaktif
+        ├── DELETE /api/devices/{id}  → hapus + archive ke Supabase
+        └── POST /api/backup/manual   → trigger backup ke Supabase
 
 Server Debian (GNS3)
     ├── main.py       → polling SNMP, ping, bandwidth (scheduler)
-    ├── menu.py       → CLI menu monitoring
-    ├── api/          → FastAPI (reboot, ping now, status)
+    ├── menu.py       → CLI menu monitoring & manajemen device
+    ├── migrate.py    → setup schema & seed device ke database
+    ├── test_api.py   → test semua endpoint API via CLI
+    ├── api/          → FastAPI server
     └── backup/       → backup otomatis ke Supabase tiap 60 menit
 
 Topologi Jaringan:
@@ -95,7 +106,9 @@ monitoring/
 ├── .env.example              # template environment variables
 ├── .gitignore
 ├── main.py                   # entry point scheduler utama
-├── menu.py                   # CLI menu interaktif
+├── menu.py                   # CLI menu + manajemen device
+├── migrate.py                # setup schema & seed device dari .env
+├── test_api.py               # test semua endpoint API via CLI
 ├── requirements.txt
 ├── api/
 │   ├── __init__.py
@@ -103,22 +116,20 @@ monitoring/
 │   └── run_api.py            # entry point API server
 ├── backup/
 │   ├── __init__.py
-│   └── supabase_backup.py    # backup & cleanup ke Supabase
+│   └── supabase_backup.py    # backup offset-based & cleanup
 ├── collectors/
 │   ├── __init__.py
 │   ├── bandwidth.py          # traffic per interface via SNMP
-│   ├── ping_monitor.py       # status up/down & latency
-│   └── snmp_collector.py     # metrics SNMP (sysName, uptime, dll)
+│   ├── ping_monitor.py       # status, latency, packet_loss
+│   └── snmp_collector.py     # SNMP metrics + macAddress + monitoringInterval
 ├── models/
 │   ├── __init__.py
-│   └── database.py           # schema tabel & koneksi DB
+│   └── database.py           # schema, koneksi DB, get_active_devices()
 ├── utils/
 │   ├── __init__.py
 │   └── logger.py             # logging ke file & terminal
-├── logs/                     # file log (tidak di-commit)
-│   ├── monitor.log
-│   └── api.log
-└── exports/                  # hasil export CSV (tidak di-commit)
+├── logs/                     # tidak di-commit
+└── exports/                  # hasil export CSV, tidak di-commit
 ```
 
 ---
@@ -136,24 +147,13 @@ cd monitoring
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-
-# Python tools
 sudo apt install -y python3-pip python3-venv python3-dev
-
-# MariaDB
 sudo apt install -y mariadb-server mariadb-client
-
-# Library SNMP sistem
 sudo apt install -y libsnmp-dev snmp snmp-mibs-downloader
-
-# Build tools
 sudo apt install -y gcc build-essential
 ```
 
 ### 3. Nonaktifkan APIPA (Khusus VirtualBox)
-
-> Jika server berjalan di VirtualBox, jalankan langkah ini agar interface
-> tidak mendapat IP 169.254.x.x yang menyebabkan konflik routing.
 
 ```bash
 sudo nano /etc/sysctl.d/no-apipa.conf
@@ -166,8 +166,6 @@ net.ipv4.conf.all.autoconf = 0
 net.ipv4.conf.default.autoconf = 0
 ```
 
-Terapkan:
-
 ```bash
 sudo sysctl --system
 ```
@@ -175,15 +173,9 @@ sudo sysctl --system
 ### 4. Setup MariaDB
 
 ```bash
-# Jalankan setup awal
 sudo mysql_secure_installation
-# Jawab Y untuk semua, set root password
-
-# Masuk ke MariaDB
 sudo mysql -u root -p
 ```
-
-Jalankan SQL berikut:
 
 ```sql
 CREATE DATABASE monitoring_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
@@ -193,241 +185,302 @@ FLUSH PRIVILEGES;
 EXIT;
 ```
 
-### 5. Buat Virtual Environment
+### 5. Virtual Environment & Library
 
 ```bash
 cd ~/monitoring
 python3 -m venv venv
 source venv/bin/activate
-```
-
-### 6. Install Library Python
-
-```bash
 pip install -r requirements.txt
 ```
 
-Atau install manual:
-
-```bash
-pip install easysnmp pymysql sqlalchemy icmplib schedule python-dotenv
-pip install fastapi uvicorn paramiko supabase
-```
-
-### 7. Setup Capability untuk icmplib
-
-> icmplib membutuhkan raw socket untuk mengirim ICMP packet.
-> Gunakan `setcap` agar tidak perlu `sudo` setiap kali menjalankan program.
+### 6. Setup Capability untuk icmplib
 
 ```bash
 sudo setcap cap_net_raw+ep ~/monitoring/venv/bin/python3
 
 # Verifikasi
 getcap ~/monitoring/venv/bin/python3
-# Output: /home/user/monitoring/venv/bin/python3 cap_net_raw+ep
+# Output: .../python3 cap_net_raw+ep
 ```
 
-> **Catatan:** Jika Python di-upgrade atau venv di-recreate,
-> jalankan `setcap` ini lagi.
+> **Penting:** Ulangi `setcap` jika Python di-upgrade atau venv di-recreate.
 
-### 8. Setup Tabel Supabase
+### 7. Setup Tabel Supabase
 
 Masuk ke **Supabase Dashboard → SQL Editor**, jalankan:
 
 ```sql
--- Tabel backup device status
+-- Backup tables
 CREATE TABLE device_status_backup (
-    id          BIGSERIAL PRIMARY KEY,
-    device      VARCHAR(50)  NOT NULL,
-    ip_address  VARCHAR(20)  NOT NULL,
-    status      VARCHAR(10)  NOT NULL,
-    latency_ms  FLOAT,
-    checked_at  TIMESTAMPTZ  NOT NULL,
-    created_at  TIMESTAMPTZ  DEFAULT NOW()
+    id BIGSERIAL PRIMARY KEY, device VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(20) NOT NULL, status VARCHAR(10) NOT NULL,
+    latency_ms FLOAT, checked_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
-
--- Tabel backup SNMP metrics
 CREATE TABLE snmp_metrics_backup (
-    id            BIGSERIAL PRIMARY KEY,
-    device        VARCHAR(50)  NOT NULL,
-    ip_address    VARCHAR(20)  NOT NULL,
-    metric_name   VARCHAR(100) NOT NULL,
-    metric_value  TEXT,
-    collected_at  TIMESTAMPTZ  NOT NULL,
-    created_at    TIMESTAMPTZ  DEFAULT NOW()
+    id BIGSERIAL PRIMARY KEY, device VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(20) NOT NULL, metric_name VARCHAR(100) NOT NULL,
+    metric_value TEXT, collected_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
-
--- Tabel backup interface traffic
 CREATE TABLE interface_traffic_backup (
-    id              BIGSERIAL PRIMARY KEY,
-    device          VARCHAR(50) NOT NULL,
-    ip_address      VARCHAR(20) NOT NULL,
-    interface_name  VARCHAR(50) NOT NULL,
-    bytes_in        BIGINT      DEFAULT 0,
-    bytes_out       BIGINT      DEFAULT 0,
-    packets_in      BIGINT      DEFAULT 0,
-    packets_out     BIGINT      DEFAULT 0,
-    collected_at    TIMESTAMPTZ NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT NOW()
+    id BIGSERIAL PRIMARY KEY, device VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(20) NOT NULL, interface_name VARCHAR(50) NOT NULL,
+    bytes_in BIGINT DEFAULT 0, bytes_out BIGINT DEFAULT 0,
+    packets_in BIGINT DEFAULT 0, packets_out BIGINT DEFAULT 0,
+    collected_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Index untuk query cepat
-CREATE INDEX idx_ds ON device_status_backup  (device, checked_at DESC);
-CREATE INDEX idx_sm ON snmp_metrics_backup   (device, collected_at DESC);
-CREATE INDEX idx_it ON interface_traffic_backup (device, collected_at DESC);
+-- Archive tables (data device yang dihapus)
+CREATE TABLE deleted_device_status (
+    id BIGSERIAL PRIMARY KEY, device VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(20) NOT NULL, status VARCHAR(10) NOT NULL,
+    latency_ms FLOAT, checked_at TIMESTAMPTZ NOT NULL,
+    deleted_at TIMESTAMPTZ DEFAULT NOW(), device_info JSONB
+);
+CREATE TABLE deleted_snmp_metrics (
+    id BIGSERIAL PRIMARY KEY, device VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(20) NOT NULL, metric_name VARCHAR(100) NOT NULL,
+    metric_value TEXT, collected_at TIMESTAMPTZ NOT NULL,
+    deleted_at TIMESTAMPTZ DEFAULT NOW(), device_info JSONB
+);
+CREATE TABLE deleted_interface_traffic (
+    id BIGSERIAL PRIMARY KEY, device VARCHAR(50) NOT NULL,
+    ip_address VARCHAR(20) NOT NULL, interface_name VARCHAR(50) NOT NULL,
+    bytes_in BIGINT DEFAULT 0, bytes_out BIGINT DEFAULT 0,
+    packets_in BIGINT DEFAULT 0, packets_out BIGINT DEFAULT 0,
+    collected_at TIMESTAMPTZ NOT NULL,
+    deleted_at TIMESTAMPTZ DEFAULT NOW(), device_info JSONB
+);
+
+-- Indexes
+CREATE INDEX idx_ds  ON device_status_backup     (device, checked_at DESC);
+CREATE INDEX idx_sm  ON snmp_metrics_backup      (device, collected_at DESC);
+CREATE INDEX idx_it  ON interface_traffic_backup (device, collected_at DESC);
+CREATE INDEX idx_dds ON deleted_device_status    (device, checked_at DESC);
+CREATE INDEX idx_dsm ON deleted_snmp_metrics     (device, collected_at DESC);
+CREATE INDEX idx_dit ON deleted_interface_traffic(device, collected_at DESC);
 ```
 
 ---
 
 ## Konfigurasi
 
-### 1. Buat File .env
+### File .env
 
 ```bash
 cp .env.example .env
 nano .env
 ```
 
-Isi semua variabel:
-
 ```env
-# ── Database MariaDB ──────────────────────────────
+# Database
 DB_HOST=localhost
 DB_PORT=3306
 DB_NAME=monitoring_db
 DB_USER=monitor_user
 DB_PASS=ganti_password_ini
 
-# ── SNMP ─────────────────────────────────────────
+# SNMP
 SNMP_COMMUNITY=public
 SNMP_PORT=161
 
-# ── IP Perangkat (Management Network) ────────────
-MAIN_ROUTER_IP=192.168.99.1
-ROUTER_KANTOR_IP=192.168.99.3
-OPENWRT_IP=192.168.99.4
-
-# ── SSH Credentials ───────────────────────────────
-# MikroTik CHR — default kosong
-MAIN_ROUTER_SSH_USER=admin
-MAIN_ROUTER_SSH_PASS=
-
-ROUTER_KANTOR_SSH_USER=admin
-ROUTER_KANTOR_SSH_PASS=
-
-# OpenWRT — sesuai password yang di-set via passwd root
-OPENWRT_SSH_USER=root
-OPENWRT_SSH_PASS=password_openwrt
-
-# ── Polling Interval (detik) ──────────────────────
+# Polling Interval (detik)
 PING_INTERVAL=30
 SNMP_INTERVAL=60
 BANDWIDTH_INTERVAL=60
 
-# ── Supabase Backup ───────────────────────────────
+# Supabase Backup
 SUPABASE_URL=https://xxxxxxxxxxxxxxxx.supabase.co
 SUPABASE_KEY=your_service_role_key
 
-# ── FastAPI Server ────────────────────────────────
+# FastAPI
 API_HOST=0.0.0.0
 API_PORT=8000
 ```
 
-### 2. Init Database
+> **Catatan:** IP dan SSH credentials device **tidak lagi** disimpan di `.env`.
+> Semua data device dikelola dari database via menu CLI atau API.
+
+---
+
+## Migrasi Database
+
+Jalankan sekali setelah setup untuk membuat semua tabel dan seed device awal:
 
 ```bash
+cd ~/monitoring
 source venv/bin/activate
-python3 -c "from models.database import init_db; init_db()"
-# Output: [DB] Tabel berhasil dibuat/diverifikasi
+python3 migrate.py
 ```
+
+Output normal:
+
+```
+==================================================
+  DATABASE MIGRATION
+==================================================
+[1/3] Membuat tabel...         [DB] Tabel berhasil dibuat/diverifikasi
+[2/3] Verifikasi tabel devices... Tabel 'devices' sudah ada.
+[3/3] Cek data device...       Sudah ada 4 device, skip seed.
+==================================================
+  MIGRASI SELESAI
+==================================================
+  [1] main-router      192.168.99.1  mikrotik  AKTIF
+  [2] router-kantor    192.168.99.3  mikrotik  AKTIF
+  [3] openwrt          192.168.99.4  openwrt   AKTIF
+  [4] router-test      192.168.99.5  mikrotik  AKTIF
+```
+
+### Schema Tabel devices
+
+| Kolom | Tipe | Keterangan |
+|-------|------|------------|
+| id | INT AUTO_INCREMENT | Primary key |
+| name | VARCHAR(50) UNIQUE | Nama unik device |
+| ip_address | VARCHAR(20) | IP management network |
+| type | VARCHAR(20) | mikrotik / openwrt / linux |
+| ssh_user | VARCHAR(50) | Username SSH |
+| ssh_pass | VARCHAR(100) | Password SSH |
+| snmp_community | VARCHAR(20) | SNMP community string |
+| is_active | INT | 1=aktif, 0=nonaktif |
+| description | VARCHAR(100) | Deskripsi opsional |
+| created_at | DATETIME | Waktu dibuat |
+| updated_at | DATETIME | Waktu terakhir diubah |
 
 ---
 
 ## Menjalankan Program
 
-> Semua perintah dijalankan dari direktori `~/monitoring`
-> dengan virtual environment aktif (`source venv/bin/activate`)
-
-### Monitoring Scheduler (main.py)
-
-Scheduler utama yang menjalankan polling ping, SNMP, bandwidth,
-dan backup Supabase secara otomatis.
+> Jalankan dari `~/monitoring` dengan venv aktif.
+> Masing-masing program di terminal terpisah.
 
 ```bash
-cd ~/monitoring
-source venv/bin/activate
-python3 main.py
+# Terminal 1 — Monitoring scheduler
+source venv/bin/activate && python3 main.py
+
+# Terminal 2 — API server
+source venv/bin/activate && python3 api/run_api.py
+
+# Terminal 3 — Menu CLI (opsional)
+source venv/bin/activate && python3 menu.py
+
+# Terminal 4 — Test API (opsional)
+source venv/bin/activate && python3 test_api.py
 ```
 
-Output normal:
-
-```
-[INFO] main — ==============================
-[INFO] main —   Network Monitoring Starting
-[INFO] main — ==============================
-[DB] Tabel berhasil dibuat/diverifikasi
-[INFO] ping_monitor  — main-router (192.168.99.1) — UP | latency: 1.15 ms
-[INFO] ping_monitor  — router-kantor (192.168.99.3) — UP | latency: 1.008 ms
-[INFO] ping_monitor  — openwrt (192.168.99.4) — UP | latency: 1.727 ms
-[INFO] snmp_collector — main-router | sysName: main-router
-[INFO] snmp_collector — main-router | totalInterfaces: 5
-[INFO] bandwidth     — main-router | [2] ether1 in:80705689 out:8363311
-[INFO] main — Scheduler aktif — ping:30s | snmp:60s | bw:60s
-[INFO] main — Backup scheduler aktif — interval: 60 menit
-```
-
-> `main.py` berjalan terus di foreground. Gunakan `Ctrl+C` untuk stop,
-> atau jalankan di background dengan `nohup python3 main.py &`.
+Swagger UI: `https://monitoring.domain.com/docs`
 
 ---
 
-### API Server (api/run_api.py)
+## API Endpoints
 
-FastAPI server untuk endpoint reboot, ping now, dan status.
-Jalankan di **terminal terpisah**.
+Base URL: `https://monitoring.domain.com`
 
+### Status & Aksi
+
+| Method | Endpoint | Deskripsi |
+|--------|----------|-----------|
+| GET | `/` | Health check |
+| GET | `/status` | Status terbaru semua device |
+| GET | `/status/{device}` | Status terbaru satu device |
+| POST | `/ping` | Ping manual → simpan ke DB |
+| POST | `/reboot` | Reboot device via SSH |
+
+### Device Management
+
+| Method | Endpoint | Deskripsi |
+|--------|----------|-----------|
+| GET | `/api/devices` | List semua device |
+| POST | `/api/devices` | Tambah device baru |
+| PUT | `/api/devices/{id}` | Update detail device |
+| PATCH | `/api/devices/{id}/toggle` | Toggle aktif/nonaktif |
+| DELETE | `/api/devices/{id}` | Hapus + archive ke Supabase |
+| DELETE | `/api/devices/cleanup/orphan` | Bersihkan data device orphan |
+
+### Backup
+
+| Method | Endpoint | Deskripsi |
+|--------|----------|-----------|
+| POST | `/api/backup/manual` | Trigger backup ke Supabase (background) |
+
+---
+
+### Contoh Request
+
+**POST /api/devices — Tambah device**
 ```bash
-cd ~/monitoring
-source venv/bin/activate
-python3 api/run_api.py
+curl -X POST https://monitoring.domain.com/api/devices \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "router-baru",
+       "ip_address": "192.168.99.10",
+       "type": "mikrotik",
+       "ssh_user": "admin",
+       "ssh_pass": "",
+       "snmp_community": "public",
+       "description": "Router lantai 2"
+     }'
+```
+```json
+{ "status": "ok", "message": "Device 'router-baru' berhasil ditambahkan", "id": 5 }
 ```
 
-Output normal:
-
+**DELETE /api/devices/{id} — Hapus + archive**
+```bash
+curl -X DELETE https://monitoring.domain.com/api/devices/5
 ```
-INFO:     Started server process
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000
+```json
+{
+  "status": "ok",
+  "message": "Device 'router-baru' berhasil dihapus beserta semua datanya",
+  "archived": { "device_status": 48, "snmp_metrics": 288, "interface_traffic": 192 },
+  "deleted_from_local": { "device_status": 48, "snmp_metrics": 288, "interface_traffic": 192 }
+}
 ```
 
-Akses dokumentasi API otomatis di browser:
-
+**POST /api/backup/manual — Trigger backup**
+```bash
+curl -X POST https://monitoring.domain.com/api/backup/manual
 ```
-http://192.168.99.2:8000/docs        # lokal
-https://monitoring.domain.com/docs   # via Cloudflare Tunnel
+```json
+{
+  "status": "accepted",
+  "message": "Backup akan dilakukan di background. Cek log untuk hasilnya.",
+  "timestamp": "2026-05-04T12:00:00"
+}
+```
+
+> Endpoint backup return `accepted` langsung — proses berjalan di background.
+> Cek progress: `tail -f ~/monitoring/logs/api.log | grep backup`
+
+### Dari Laravel
+
+```php
+$base = config('services.monitoring.url');
+
+// Tambah device
+Http::post("{$base}/api/devices", [
+    'name' => 'router-baru', 'ip_address' => '192.168.99.10',
+    'type' => 'mikrotik', 'ssh_user' => 'admin',
+    'ssh_pass' => '', 'snmp_community' => 'public',
+])->json();
+
+// Hapus device (archive otomatis ke Supabase)
+Http::delete("{$base}/api/devices/5")->json();
+
+// Trigger backup manual
+Http::post("{$base}/api/backup/manual")->json();
 ```
 
 ---
 
-### Menu CLI (menu.py)
-
-Menu interaktif untuk monitoring, export data, dan backup manual.
-Jalankan di **terminal terpisah** — tidak mengganggu `main.py`.
-
-```bash
-cd ~/monitoring
-source venv/bin/activate
-python3 menu.py
-```
-
-Tampilan menu:
+## Menu CLI
 
 ```
 ====================================================
      NETWORK MONITORING — MENU UTAMA
-====================================================
-  Waktu : 2026-04-27 16:06:41
 ====================================================
   [1] Status perangkat (realtime)
   [2] Lihat log lokal
@@ -435,279 +488,95 @@ Tampilan menu:
   [4] Backup manual ke Supabase
   [5] Statistik database
   [6] Export data ke CSV
+  [7] Manajemen device
   [0] Keluar
 ====================================================
-Pilih menu:
 ```
 
-> Menu tidak membutuhkan `sudo`. Keluar dari menu tidak menghentikan
-> `main.py` yang berjalan di terminal lain.
-
----
-
-## API Endpoints
-
-Base URL: `http://192.168.99.2:8000` atau `https://monitoring.domain.com`
-
-| Method | Endpoint | Deskripsi |
-|--------|----------|-----------|
-| GET | `/` | Info service & status |
-| GET | `/devices` | Daftar semua device |
-| GET | `/status` | Status terbaru semua device |
-| GET | `/status/{device}` | Status terbaru satu device |
-| POST | `/ping` | Ping manual ke device |
-| POST | `/reboot` | Reboot device via SSH |
-
-### Contoh Request
-
-**GET /status**
-```bash
-curl https://monitoring.domain.com/status
-```
-
-Response:
-```json
-{
-  "status": "ok",
-  "data": [
-    {
-      "device": "main-router",
-      "ip_address": "192.168.99.1",
-      "status": "up",
-      "latency_ms": 0.98,
-      "checked_at": "2026-04-28T20:18:24"
-    }
-  ]
-}
-```
-
-**POST /ping**
-```bash
-curl -X POST https://monitoring.domain.com/ping \
-     -H "Content-Type: application/json" \
-     -d '{"device": "main-router"}'
-```
-
-Response:
-```json
-{
-  "status": "ok",
-  "device": "main-router",
-  "ip_address": "192.168.99.1",
-  "ping_result": "up",
-  "latency_ms": 0.794,
-  "checked_at": "2026-04-28T20:20:15"
-}
-```
-
-**POST /reboot**
-```bash
-curl -X POST https://monitoring.domain.com/reboot \
-     -H "Content-Type: application/json" \
-     -d '{"device": "openwrt"}'
-```
-
-Response:
-```json
-{
-  "status": "ok",
-  "device": "openwrt",
-  "message": "Reboot command berhasil dikirim ke openwrt",
-  "note": "Device akan restart dalam beberapa detik",
-  "sent_at": "2026-04-28T20:25:00"
-}
-```
-
-### Contoh dari Laravel
-
-```php
-use Illuminate\Support\Facades\Http;
-
-$base = 'https://monitoring.domain.com';
-
-// Status semua device
-$status = Http::get("{$base}/status")->json();
-
-// Ping manual
-$ping = Http::post("{$base}/ping", [
-    'device' => 'main-router'
-])->json();
-
-// Reboot device
-$reboot = Http::post("{$base}/reboot", [
-    'device' => 'openwrt'
-])->json();
-```
-
----
-
-## Menu CLI
-
-### [1] Status Perangkat
-
-Menampilkan status UP/DOWN dan latency terbaru per perangkat
-dari database lokal.
+### Menu [7] Manajemen Device
 
 ```
-====================================================
-  STATUS PERANGKAT — REALTIME
-====================================================
-Perangkat         IP                Status    Latency
-----------------  ----------------  --------  --------
-main-router       192.168.99.1      ✓ UP      0.98 ms
-router-kantor     192.168.99.3      ✓ UP      0.885 ms
-openwrt           192.168.99.4      ✓ UP      0.868 ms
+  [1] Lihat semua device
+  [2] Tambah device baru
+  [3] Toggle aktif / nonaktif
+  [4] Hapus device permanen (archive ke Supabase)
 ```
 
-### [2] Log Lokal
-
-Lihat 20 data terbaru dari MariaDB.
-Sub-menu: Device Status / SNMP Metrics / Interface Traffic.
-
-### [3] Backup Supabase
-
-Lihat 20 data terbaru dari Supabase (histori backup).
-Sub-menu: Device Status / SNMP Metrics / Interface Traffic.
-
-### [4] Backup Manual
-
-Jalankan backup + cleanup sekarang tanpa menunggu scheduler 60 menit.
-
-### [5] Statistik Database
-
-```
-DATABASE LOKAL (MariaDB)
-Tabel                 Total Row   Retain Max    Penuh (%)
---------------------  ----------  ------------  ----------
-device_status         850         1200          70.8%
-snmp_metrics          2100        3500          60.0%
-interface_traffic     1200        2500          48.0%
-
-Data terlama : 2026-04-28 18:00:00
-Data terbaru : 2026-04-28 21:00:00
-
-DATABASE BACKUP (Supabase)
-device_status_backup                1828 records
-snmp_metrics_backup                 6543 records
-interface_traffic_backup            4320 records
-```
-
-### [6] Export CSV
-
-Export data ke file CSV di folder `~/monitoring/exports/`.
-Pilih sumber (lokal/Supabase) dan tipe data.
-
-```
-exports/
-  device_status_20260428_210000.csv
-  snmp_metrics_20260428_210000.csv
-  interface_traffic_20260428_210000.csv
-```
+Perubahan device langsung efektif pada siklus berikutnya — tidak perlu restart `main.py`.
 
 ---
 
 ## Backup Supabase
 
-Backup berjalan otomatis setiap **60 menit** via scheduler di `main.py`.
+### Skema Offset-Based Retention
 
-### Skema Retention (Offset-based)
+Data dihapus berdasarkan jumlah row, bukan waktu. Mencegah data hilang saat device down lama.
 
-Data tidak dihapus berdasarkan waktu, melainkan berdasarkan
-jumlah row agar data tidak hilang saat perangkat down lama.
+| Tabel | Retain Lokal | Coverage |
+|-------|-------------|----------|
+| device_status | 1200 row | ~3 jam |
+| snmp_metrics | 3500 row | ~3 jam |
+| interface_traffic | 2500 row | ~3 jam |
 
-| Tabel | Retain Lokal | Keterangan |
-|-------|-------------|------------|
-| device_status | 1200 row | ~3 jam data |
-| snmp_metrics | 3500 row | ~3 jam data |
-| interface_traffic | 2500 row | ~3 jam data |
+### Archive Device Dihapus
 
-### Estimasi Storage Supabase
+Saat device dihapus, semua data monitoring otomatis di-archive ke tabel
+`deleted_device_status`, `deleted_snmp_metrics`, `deleted_interface_traffic`
+di Supabase sebelum dihapus dari database lokal.
+Setiap record menyimpan `device_info` (JSON) sebagai referensi historis.
 
-| Periode | Storage | Records |
-|---------|---------|---------|
-| Per jam | ~342 KB | ~2160 records |
-| Per hari | ~8 MB | ~51840 records |
-| Per bulan | ~240 MB | ~1.5 juta records |
-| Free tier (500 MB) | ~2 bulan | — |
+### Estimasi Storage
 
-### Backup Manual
-
-```bash
-source venv/bin/activate
-python3 -c "from backup.supabase_backup import run; run()"
-```
+| Periode | Storage |
+|---------|---------|
+| Per hari | ~8 MB |
+| Per bulan | ~240 MB |
+| Free tier (500 MB) | ~2 bulan |
 
 ---
 
 ## Troubleshooting
 
-### icmplib error: permission denied
-
+**icmplib: permission denied**
 ```bash
-# Set capability raw socket
 sudo setcap cap_net_raw+ep ~/monitoring/venv/bin/python3
-
-# Verifikasi
-getcap ~/monitoring/venv/bin/python3
 ```
 
-### ModuleNotFoundError saat pakai sudo
-
+**ModuleNotFoundError saat pakai sudo**
 ```bash
-# Jangan pakai sudo python3, tapi:
 sudo ~/monitoring/venv/bin/python3 main.py
-
-# Atau gunakan setcap agar tidak perlu sudo sama sekali
-sudo setcap cap_net_raw+ep ~/monitoring/venv/bin/python3
-python3 main.py  # tanpa sudo
 ```
 
-### SNMP timeout ke openWRT
-
+**SNMP timeout ke openWRT**
 ```bash
-# Pastikan snmpd jalan di openWRT
-/etc/init.d/snmpd status
-
-# Restart kalau perlu
 /etc/init.d/snmpd restart
-
-# Test dari server
 snmpwalk -v2c -c public 192.168.99.4 1.3.6.1.2.1.1
 ```
 
-### SSH Authentication Failed (reboot endpoint)
-
+**SSH Authentication Failed**
 ```bash
-# Test SSH manual dulu
-ssh admin@192.168.99.1   # MikroTik
-ssh root@192.168.99.4    # OpenWRT
-
-# Pastikan .env sudah benar dan API sudah direstart
-pkill -f run_api.py
-python3 api/run_api.py
+ssh admin@192.168.99.1  # test koneksi manual
+# Cek credentials di tabel devices via menu CLI [7][1]
 ```
 
-### easysnmp hanya return 1 interface
+**Device tidak termonitor setelah ditambah**
 
-Interface index diambil dari `item.oid` bukan `item.oid_index`
-karena easysnmp versi ini return `oid_index` kosong.
-Sudah di-handle di `collectors/bandwidth.py` via:
+Normal — device baru mulai dimonitor pada siklus berikutnya (maks 30-60 detik). Tidak perlu restart `main.py`.
 
-```python
-idx = str(item.oid).strip().split('.')[-1]
+**Data orphan setelah hapus device lama**
+```bash
+curl -X DELETE https://monitoring.domain.com/api/devices/cleanup/orphan
 ```
 
-### Database lokal kosong setelah backup
-
-Normal jika semua data sudah lebih tua dari threshold retain.
-Jalankan `main.py` dan tunggu beberapa menit hingga data baru masuk.
+**Backup tidak merespons**
+```bash
+tail -f ~/monitoring/logs/api.log | grep backup
+```
 
 ---
 
 ## Catatan Penting
 
-- Gunakan `enp0s3` bukan `eth0` di `/etc/network/interfaces` pada Debian VirtualBox
-- OpenWRT 25.12 menggunakan `apk` (bukan `opkg`) dan `nftables` (bukan `iptables`)
-- File `.env` **jangan pernah** di-commit ke GitHub
+- OpenWRT 25.12: `apk` (bukan `opkg`), `nftables` (bukan `iptables`), editor `vi` (bukan `nano`)
+- Perubahan device (tambah/hapus/toggle) **tidak perlu restart** `main.py`
 - `setcap` perlu diulang jika Python di-upgrade atau venv di-recreate
-- `menu.py` dan `api/run_api.py` dijalankan di terminal terpisah dari `main.py`
