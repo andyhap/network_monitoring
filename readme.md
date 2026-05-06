@@ -580,3 +580,4 @@ tail -f ~/monitoring/logs/api.log | grep backup
 - OpenWRT 25.12: `apk` (bukan `opkg`), `nftables` (bukan `iptables`), editor `vi` (bukan `nano`)
 - Perubahan device (tambah/hapus/toggle) **tidak perlu restart** `main.py`
 - `setcap` perlu diulang jika Python di-upgrade atau venv di-recreate
+- `menu.py` dan `api/run_api.py` dijalankan di terminal terpisah dari `main.py`
