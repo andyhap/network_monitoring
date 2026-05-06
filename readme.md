@@ -706,8 +706,6 @@ Jalankan `main.py` dan tunggu beberapa menit hingga data baru masuk.
 
 ## Catatan Penting
 
-- Gunakan `enp0s3` bukan `eth0` di `/etc/network/interfaces` pada Debian VirtualBox
 - OpenWRT 25.12 menggunakan `apk` (bukan `opkg`) dan `nftables` (bukan `iptables`)
-- File `.env` **jangan pernah** di-commit ke GitHub
 - `setcap` perlu diulang jika Python di-upgrade atau venv di-recreate
 - `menu.py` dan `api/run_api.py` dijalankan di terminal terpisah dari `main.py`
