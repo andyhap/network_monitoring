@@ -2,6 +2,7 @@ import icmplib
 from datetime import datetime
 from models.database import get_session, DeviceStatus, SnmpMetric, get_active_devices
 from utils.logger import get_logger
+from utils import device_state
 
 logger = get_logger('ping_monitor')
 

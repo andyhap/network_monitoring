@@ -2,6 +2,7 @@ from datetime import datetime
 from easysnmp import Session, EasySNMPError
 from models.database import get_session, SnmpMetric, get_active_devices
 from utils.logger import get_logger
+from utils import device_state
 
 logger = get_logger('snmp_collector')
 
@@ -88,6 +89,11 @@ def poll_device(device: dict):
 
 
 def run():
+    # Jika semua device down → pause total agar log tidak membengkak
+    if device_state.all_down():
+        logger.warning("=== SNMP Collector PAUSE — semua device DOWN ===")
+        return
+
     logger.info("=== SNMP Collector mulai ===")
     devices = get_active_devices()
     if not devices:

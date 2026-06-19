@@ -2,6 +2,7 @@ from datetime import datetime
 from easysnmp import Session, EasySNMPError
 from models.database import get_session, InterfaceTraffic, get_active_devices
 from utils.logger import get_logger
+from utils import device_state
 
 logger = get_logger('bandwidth')
 
@@ -37,6 +38,7 @@ def poll_device(device: dict):
     community = device['snmp_community']
 
     try:
+        # timeout=2, retries=1 → maks 4s per walk (vs 15s sebelumnya)
         snmp_session = Session(
             hostname=ip, community=community,
             version=2, remote_port=161,
@@ -85,6 +87,11 @@ def poll_device(device: dict):
 
 
 def run():
+    # Jika semua device down → pause total agar log tidak membengkak
+    if device_state.all_down():
+        logger.warning("=== Bandwidth Monitor PAUSE — semua device DOWN ===")
+        return
+
     logger.info("=== Bandwidth Monitor mulai ===")
     devices = get_active_devices()
     if not devices:

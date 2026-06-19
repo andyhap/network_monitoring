@@ -51,3 +51,9 @@ desktop.ini
 *.bak
 *.swp
 *~
+
+# nix shell
+shell.nix
+
+# others
+CLAUDE.md
