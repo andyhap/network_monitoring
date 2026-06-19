@@ -25,6 +25,9 @@ def check_device(device: dict):
         status, latency, packet_loss = 'down', None, 100.0
         logger.error(f"{name} ({ip}) — ERROR: {e}")
 
+    # Update shared state agar SNMP/bandwidth bisa skip device yang down
+    device_state.update(name, status == 'up')
+
     now = datetime.now()
     session = get_session()
     try:
@@ -60,3 +63,6 @@ def run():
         return
     for device in devices:
         check_device(device)
+
+    if device_state.all_down():
+        logger.warning("=== SEMUA DEVICE DOWN — SNMP/Bandwidth di-PAUSE sampai ada yang kembali UP ===")

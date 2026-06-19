@@ -37,12 +37,17 @@ def poll_device(device: dict):
     ip        = device['ip_address']
     community = device['snmp_community']
 
+    # Skip device yang diketahui down dari hasil ping terakhir
+    if not device_state.is_up(name):
+        logger.warning(f"{name} ({ip}) — DOWN (ping), Bandwidth dilewati")
+        return
+
     try:
         # timeout=2, retries=1 → maks 4s per walk (vs 15s sebelumnya)
         snmp_session = Session(
             hostname=ip, community=community,
             version=2, remote_port=161,
-            timeout=5, retries=2
+            timeout=2, retries=1
         )
 
         names   = walk_to_dict(snmp_session, OID_IF_NAME)
