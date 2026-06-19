@@ -510,7 +510,7 @@ def trigger_manual_backup(background_tasks: BackgroundTasks):
         
         return {
             "status": "accepted",
-            "message": "Backup akan dilakukan di background. Cek log untuk hasilnya.",
+            "message": "Backup akan dilakukan di background.",
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
