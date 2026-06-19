@@ -4,6 +4,7 @@ from easysnmp import Session, EasySNMPError
 from dotenv import load_dotenv
 from models.database import get_session, SnmpMetric
 from utils.logger import get_logger
+from utils import device_state
 
 load_dotenv()
 logger = get_logger('snmp_collector')
@@ -29,9 +30,15 @@ OIDS = {
 }
 
 def poll_device(name: str, ip: str):
+    # Skip device yang diketahui down dari hasil ping terakhir
+    if not device_state.is_up(name):
+        logger.warning(f"{name} ({ip}) — DOWN (ping), SNMP dilewati")
+        return
+
     try:
+        # timeout=2, retries=1 → maks 4s per OID (vs 15s sebelumnya)
         session = Session(hostname=ip, community=COMMUNITY,
-                          version=2, remote_port=PORT, timeout=5, retries=2)
+                          version=2, remote_port=PORT, timeout=2, retries=1)
         db_session = get_session()
         for metric_name, oid in OIDS.items():
             try:
@@ -53,6 +60,13 @@ def poll_device(name: str, ip: str):
         logger.error(f"SNMP error pada {name} ({ip}): {e}")
 
 def run():
+    # Jika semua device down → pause total agar log tidak membengkak
+    if device_state.all_down():
+        logger.warning("=== SNMP Collector PAUSE — semua device DOWN ===")
+        return
+
     logger.info("=== SNMP Collector mulai ===")
     for name, ip in DEVICES.items():
+        if not ip:
+            continue
         poll_device(name, ip)

@@ -4,6 +4,7 @@ from easysnmp import Session, EasySNMPError
 from dotenv import load_dotenv
 from models.database import get_session, InterfaceTraffic
 from utils.logger import get_logger
+from utils import device_state
 
 load_dotenv()
 logger = get_logger('bandwidth')
@@ -51,14 +52,20 @@ def walk_to_dict(session, oid):
     return result
 
 def poll_device(name: str, ip: str):
+    # Skip device yang diketahui down dari hasil ping terakhir
+    if not device_state.is_up(name):
+        logger.warning(f"{name} ({ip}) — DOWN (ping), Bandwidth dilewati")
+        return
+
     try:
+        # timeout=2, retries=1 → maks 4s per walk (vs 15s sebelumnya)
         snmp_session = Session(
             hostname=ip,
             community=COMMUNITY,
             version=2,
             remote_port=PORT,
-            timeout=5,
-            retries=2
+            timeout=2,
+            retries=1
         )
 
         # Ambil semua data sekaligus
@@ -111,6 +118,13 @@ def poll_device(name: str, ip: str):
         logger.error(f"Bandwidth error pada {name} ({ip}): {e}")
 
 def run():
+    # Jika semua device down → pause total agar log tidak membengkak
+    if device_state.all_down():
+        logger.warning("=== Bandwidth Monitor PAUSE — semua device DOWN ===")
+        return
+
     logger.info("=== Bandwidth Monitor mulai ===")
     for name, ip in DEVICES.items():
+        if not ip:
+            continue
         poll_device(name, ip)

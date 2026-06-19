@@ -4,6 +4,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from models.database import get_session, DeviceStatus
 from utils.logger import get_logger
+from utils import device_state
 
 load_dotenv()
 logger = get_logger('ping_monitor')
@@ -25,6 +26,9 @@ def check_device(name: str, ip: str):
         status, latency = 'down', None
         logger.error(f"{name} ({ip}) — ERROR: {e}")
 
+    # Update shared state agar SNMP/bandwidth bisa skip device yang down
+    device_state.update(name, status == 'up')
+
     session = get_session()
     try:
         session.add(DeviceStatus(
@@ -42,4 +46,9 @@ def check_device(name: str, ip: str):
 def run():
     logger.info("=== Ping Monitor mulai ===")
     for name, ip in DEVICES.items():
+        if not ip:
+            continue
         check_device(name, ip)
+
+    if device_state.all_down():
+        logger.warning("=== SEMUA DEVICE DOWN — SNMP/Bandwidth di-PAUSE sampai ada yang kembali UP ===")
