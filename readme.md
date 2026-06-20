@@ -580,3 +580,7 @@ tail -f ~/monitoring/logs/api.log | grep backup
 - OpenWRT 25.12 menggunakan `apk` (bukan `opkg`) dan `nftables` (bukan `iptables`)
 - `setcap` perlu diulang jika Python di-upgrade atau venv di-recreate
 - `menu.py` dan `api/run_api.py` dijalankan di terminal terpisah dari `main.py`
+
+## License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
