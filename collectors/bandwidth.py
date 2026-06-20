@@ -91,6 +91,10 @@ def poll_device(device: dict) -> list:
 
 
 def run():
+    if not ws_client.is_connected():
+        logger.warning("=== Bandwidth Monitor PAUSE — menunggu koneksi WS server ===")
+        return
+
     if device_state.all_down():
         logger.warning("=== Bandwidth Monitor PAUSE — semua device DOWN ===")
         return

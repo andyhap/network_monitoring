@@ -20,6 +20,13 @@ def main():
     ws_secret  = os.getenv('WS_SECRET', '')
     ws_client.start(server_url, ws_secret)
 
+    # Tunggu koneksi WS sebelum polling pertama (maks 30 detik)
+    logger.info("Menunggu koneksi ke WebSocket server...")
+    if ws_client.wait_connected(timeout=30):
+        logger.info("Terkoneksi — memulai polling pertama")
+    else:
+        logger.warning("Timeout 30s — collector akan mulai saat koneksi terbentuk")
+
     # Jalankan sekali langsung saat start
     ping_monitor.run()
     snmp_collector.run()

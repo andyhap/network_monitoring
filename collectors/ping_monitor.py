@@ -38,6 +38,10 @@ def ping_device(device: dict, silent: bool = False) -> dict:
 
 
 def run():
+    if not ws_client.is_connected():
+        logger.warning("=== Ping Monitor PAUSE — menunggu koneksi WS server ===")
+        return
+
     was_all_down = device_state.all_down()
 
     devices = get_active_devices()

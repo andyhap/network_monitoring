@@ -7,11 +7,13 @@ Desain:
 - Jika koneksi putus, reconnect otomatis. Payload yang gagal dikirim
   dikembalikan ke queue agar tidak hilang.
 - Queue dibatasi 500 item; jika penuh, item terlama dibuang.
+- is_connected() dipakai collector untuk pause/resume otomatis.
 """
 
 import asyncio
 import json
 import queue
+import time
 import threading
 
 import websockets
@@ -54,6 +56,20 @@ def is_connected() -> bool:
     return _connected
 
 
+def wait_connected(timeout: float = 30) -> bool:
+    """
+    Block thread pemanggil sampai terkoneksi ke server atau timeout habis.
+    Return True jika berhasil, False jika timeout.
+    Dipanggil di main.py sebelum polling pertama dimulai.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _connected:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 # ── Internal ──────────────────────────────────────────────────
 
 def _run_event_loop() -> None:
@@ -64,17 +80,30 @@ def _run_event_loop() -> None:
 
 async def _connect_forever() -> None:
     global _connected
-    retry_delay = 5
+    was_connected = False  # track state sebelumnya agar log tidak berulang
+    retry_delay   = 5
 
     while True:
         try:
             async with websockets.connect(_ws_url, ping_interval=30) as ws:
-                _connected = True
-                logger.info("[WS] Terhubung ke server")
+                _connected    = True
+                was_connected = True
+                logger.info("[WS] Terhubung ke server — semua collector RESUME")
                 await _drain_queue(ws)
+
         except Exception as e:
             _connected = False
-            logger.error(f"[WS] Koneksi terputus — {e}. Retry dalam {retry_delay}s...")
+            if was_connected:
+                # Baru saja putus — log sekali sebagai WARNING
+                logger.warning(
+                    f"[WS] Koneksi terputus — semua collector di-PAUSE. "
+                    f"Retry dalam {retry_delay}s... ({e})"
+                )
+                was_connected = False
+            else:
+                # Masih gagal sejak awal / retry — log ERROR tanpa spam
+                logger.error(f"[WS] Gagal terhubung: {e}. Retry dalam {retry_delay}s...")
+
             await asyncio.sleep(retry_delay)
 
 
