@@ -1,8 +1,9 @@
+import os
 import paramiko
 import icmplib
 from datetime import datetime
-from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -516,6 +517,236 @@ def trigger_manual_backup(background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f"[API] Gagal memicu endpoint backup: {str(e)}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Terjadi kesalahan internal server saat memicu backup: {str(e)}"
         )
+
+
+# ── WebSocket Server ─────────────────────────────────────────
+
+WS_SECRET = os.getenv('WS_SECRET', '')
+
+
+class ConnectionManager:
+    def __init__(self):
+        self._clients: List[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self._clients.append(ws)
+        logger.info(f"[WS] Client terhubung dari {ws.client.host} — total: {len(self._clients)}")
+
+    def disconnect(self, ws: WebSocket):
+        self._clients.remove(ws)
+        logger.info(f"[WS] Client terputus — total: {len(self._clients)}")
+
+    @property
+    def count(self) -> int:
+        return len(self._clients)
+
+
+ws_manager = ConnectionManager()
+
+
+def _ws_save_ping_result(payload: dict):
+    """
+    Terima hasil ping dari client dan simpan ke device_status + snmp_metrics(packet_loss).
+
+    Format payload:
+    {
+        "type": "ping_result",
+        "device": "main-router",
+        "ip_address": "192.168.99.1",
+        "status": "up",          # "up" | "down"
+        "latency_ms": 1.234,     # null jika down
+        "packet_loss": 0.0,      # 0.0 - 100.0
+        "collected_at": "2026-06-20T10:00:00"  # opsional, default=now
+    }
+    """
+    name        = payload['device']
+    ip          = payload['ip_address']
+    status      = payload['status']
+    latency     = payload.get('latency_ms')
+    packet_loss = payload.get('packet_loss', 100.0)
+    collected_at_raw = payload.get('collected_at')
+    collected_at = datetime.fromisoformat(collected_at_raw) if collected_at_raw else datetime.now()
+
+    session = get_session()
+    try:
+        session.add(DeviceStatus(
+            device=name, ip_address=ip,
+            status=status, latency_ms=latency,
+            checked_at=collected_at
+        ))
+        session.add(SnmpMetric(
+            device=name, ip_address=ip,
+            metric_name='packet_loss',
+            metric_value=str(packet_loss),
+            collected_at=collected_at
+        ))
+        session.commit()
+        logger.info(f"[WS] ping_result: {name} {status.upper()} | {latency}ms | loss:{packet_loss}%")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"[WS] DB error ping_result {name}: {e}")
+        raise
+    finally:
+        session.close()
+
+
+def _ws_save_snmp_metrics(payload: dict):
+    """
+    Terima raw SNMP metrics dari client dan simpan ke snmp_metrics.
+
+    Format payload:
+    {
+        "type": "snmp_metrics",
+        "device": "main-router",
+        "ip_address": "192.168.99.1",
+        "collected_at": "2026-06-20T10:00:00",
+        "metrics": [
+            {"name": "sysName",    "value": "MikroTik"},
+            {"name": "sysUpTime",  "value": "1234567"},
+            {"name": "macAddress", "value": "AA:BB:CC:DD:EE:FF"},
+            ...
+        ]
+    }
+    """
+    name    = payload['device']
+    ip      = payload['ip_address']
+    metrics = payload.get('metrics', [])
+    collected_at_raw = payload.get('collected_at')
+    collected_at = datetime.fromisoformat(collected_at_raw) if collected_at_raw else datetime.now()
+
+    session = get_session()
+    try:
+        for m in metrics:
+            session.add(SnmpMetric(
+                device=name, ip_address=ip,
+                metric_name=m['name'],
+                metric_value=str(m['value']),
+                collected_at=collected_at
+            ))
+        session.commit()
+        logger.info(f"[WS] snmp_metrics: {name} — {len(metrics)} metrics disimpan")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"[WS] DB error snmp_metrics {name}: {e}")
+        raise
+    finally:
+        session.close()
+
+
+def _ws_save_interface_traffic(payload: dict):
+    """
+    Terima raw SNMP interface counters dari client dan simpan ke interface_traffic.
+
+    Format payload:
+    {
+        "type": "interface_traffic",
+        "device": "main-router",
+        "ip_address": "192.168.99.1",
+        "collected_at": "2026-06-20T10:00:00",
+        "interfaces": [
+            {
+                "name": "ether1",
+                "bytes_in": 1234567,
+                "bytes_out": 2345678,
+                "packets_in": 1234,
+                "packets_out": 2345
+            }
+        ]
+    }
+    """
+    name       = payload['device']
+    ip         = payload['ip_address']
+    interfaces = payload.get('interfaces', [])
+    collected_at_raw = payload.get('collected_at')
+    collected_at = datetime.fromisoformat(collected_at_raw) if collected_at_raw else datetime.now()
+
+    session = get_session()
+    try:
+        for iface in interfaces:
+            session.add(InterfaceTraffic(
+                device=name, ip_address=ip,
+                interface_name=iface['name'],
+                bytes_in=iface.get('bytes_in', 0),
+                bytes_out=iface.get('bytes_out', 0),
+                packets_in=iface.get('packets_in', 0),
+                packets_out=iface.get('packets_out', 0),
+                collected_at=collected_at
+            ))
+        session.commit()
+        logger.info(f"[WS] interface_traffic: {name} — {len(interfaces)} interface disimpan")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"[WS] DB error interface_traffic {name}: {e}")
+        raise
+    finally:
+        session.close()
+
+
+_WS_HANDLERS = {
+    'ping_result':       _ws_save_ping_result,
+    'snmp_metrics':      _ws_save_snmp_metrics,
+    'interface_traffic': _ws_save_interface_traffic,
+}
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, key: str = Query(default='')):
+    """
+    WebSocket endpoint untuk menerima data monitoring dari collector client.
+    Autentikasi via query param: ws://<host>:<port>/ws?key=<WS_SECRET>
+    Jika WS_SECRET kosong di .env, autentikasi dilewati.
+    """
+    if WS_SECRET and key != WS_SECRET:
+        await websocket.close(code=4001, reason="Unauthorized")
+        logger.warning(f"[WS] Koneksi ditolak dari {websocket.client.host} — key salah")
+        return
+
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            msg_type = payload.get('type')
+
+            handler = _WS_HANDLERS.get(msg_type)
+            if not handler:
+                await websocket.send_json({
+                    "status":  "error",
+                    "type":    msg_type,
+                    "message": f"Unknown type '{msg_type}'. Valid: {list(_WS_HANDLERS)}"
+                })
+                continue
+
+            try:
+                # Handler sinkron dijalankan di thread pool agar tidak blokir event loop
+                await asyncio.to_thread(handler, payload)
+                await websocket.send_json({"status": "ok", "type": msg_type})
+            except KeyError as e:
+                await websocket.send_json({
+                    "status":  "error",
+                    "type":    msg_type,
+                    "message": f"Field wajib tidak ada: {e}"
+                })
+            except Exception as e:
+                await websocket.send_json({
+                    "status":  "error",
+                    "type":    msg_type,
+                    "message": str(e)
+                })
+
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+
+
+@app.get("/ws/status")
+def ws_status():
+    """Info WebSocket server — jumlah client yang terkoneksi"""
+    return {
+        "status":           "ok",
+        "connected_clients": ws_manager.count,
+        "accepted_types":   list(_WS_HANDLERS),
+        "auth_required":    bool(WS_SECRET),
+    }
