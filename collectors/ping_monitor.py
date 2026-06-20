@@ -1,17 +1,17 @@
 import icmplib
 from datetime import datetime
-from models.database import get_session, DeviceStatus, SnmpMetric, get_active_devices
+from models.database import get_active_devices
 from utils.logger import get_logger
-from utils import device_state
+from utils import device_state, ws_client
 
 logger = get_logger('ping_monitor')
 
 
 def ping_device(device: dict, silent: bool = False) -> dict:
     """
-    Hanya ICMP ping dan update device_state. Tidak menulis ke DB.
+    ICMP ping ke satu device, update device_state.
     silent=True menekan log per-device saat pause mode (kecuali UP).
-    Return: dict hasil ping untuk di-batch-save nanti.
+    Return: dict hasil ping untuk dikirim ke server.
     """
     name = device['name']
     ip   = device['ip_address']
@@ -37,31 +37,6 @@ def ping_device(device: dict, silent: bool = False) -> dict:
             'latency': latency, 'packet_loss': packet_loss}
 
 
-def _save_to_db(results: list):
-    """Simpan batch hasil ping ke database (device_status + packet_loss di snmp_metrics)."""
-    now     = datetime.now()
-    session = get_session()
-    try:
-        for r in results:
-            session.add(DeviceStatus(
-                device=r['name'], ip_address=r['ip'],
-                status=r['status'], latency_ms=r['latency'],
-                checked_at=now
-            ))
-            session.add(SnmpMetric(
-                device=r['name'], ip_address=r['ip'],
-                metric_name='packet_loss',
-                metric_value=str(r['packet_loss']),
-                collected_at=now
-            ))
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        logger.error(f"DB error saat simpan ping results: {e}")
-    finally:
-        session.close()
-
-
 def run():
     was_all_down = device_state.all_down()
 
@@ -71,25 +46,31 @@ def run():
         return
 
     if was_all_down:
-        # Sudah dalam mode pause — log satu baris saja, suppress per-device
         logger.warning("=== Ping Monitor (PAUSE) — cek recovery ===")
     else:
         logger.info("=== Ping Monitor mulai ===")
 
-    # Kumpulkan hasil ping dulu, baru putuskan apakah perlu tulis ke DB
     results = []
     for device in devices:
         results.append(ping_device(device, silent=was_all_down))
 
     if device_state.all_down():
         if not was_all_down:
-            # Baru saja masuk pause mode — catat satu kali
-            logger.warning("=== SEMUA DEVICE DOWN — monitoring di-PAUSE, tidak ada data ditulis ke DB ===")
-        # Tidak tulis apapun ke DB
+            logger.warning("=== SEMUA DEVICE DOWN — data tidak dikirim ke server ===")
         return
 
-    # Ada device yang UP → tulis semua hasil ke DB
     if was_all_down:
         logger.info("=== Device kembali UP — monitoring RESUME ===")
 
-    _save_to_db(results)
+    # Kirim semua hasil ping ke server via WebSocket
+    collected_at = datetime.now().isoformat()
+    for r in results:
+        ws_client.send({
+            'type':         'ping_result',
+            'device':       r['name'],
+            'ip_address':   r['ip'],
+            'status':       r['status'],
+            'latency_ms':   r['latency'],
+            'packet_loss':  r['packet_loss'],
+            'collected_at': collected_at,
+        })

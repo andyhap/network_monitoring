@@ -1,8 +1,8 @@
 from datetime import datetime
 from easysnmp import Session, EasySNMPError
-from models.database import get_session, InterfaceTraffic, get_active_devices
+from models.database import get_active_devices
 from utils.logger import get_logger
-from utils import device_state
+from utils import device_state, ws_client
 
 logger = get_logger('bandwidth')
 
@@ -32,18 +32,21 @@ def walk_to_dict(session, oid):
     return result
 
 
-def poll_device(device: dict):
+def poll_device(device: dict) -> list:
+    """
+    Poll interface traffic counters dari satu device via SNMP.
+    Return list of interface dicts, atau [] jika skip/gagal.
+    """
     name      = device['name']
     ip        = device['ip_address']
     community = device['snmp_community']
 
-    # Skip device yang diketahui down dari hasil ping terakhir
     if not device_state.is_up(name):
         logger.warning(f"{name} ({ip}) — DOWN (ping), Bandwidth dilewati")
-        return
+        return []
 
     try:
-        # timeout=2, retries=1 → maks 4s per walk (vs 15s sebelumnya)
+        # timeout=2, retries=1 → maks 4s per walk
         snmp_session = Session(
             hostname=ip, community=community,
             version=2, remote_port=161,
@@ -58,11 +61,9 @@ def poll_device(device: dict):
 
         if not names:
             logger.warning(f"{name} ({ip}) — tidak ada interface ditemukan via SNMP")
-            return
+            return []
 
-        db_session = get_session()
-        saved = 0
-
+        interfaces = []
         for idx, iface_name in names.items():
             if iface_name.lower() in ('lo', 'loopback'):
                 continue
@@ -73,26 +74,23 @@ def poll_device(device: dict):
             p_out = safe_int(out_pkt.get(idx, 0))
 
             logger.info(f"{name} | [{idx}] {iface_name} in:{b_in} out:{b_out}")
+            interfaces.append({
+                'name':        iface_name,
+                'bytes_in':    b_in,
+                'bytes_out':   b_out,
+                'packets_in':  p_in,
+                'packets_out': p_out,
+            })
 
-            db_session.add(InterfaceTraffic(
-                device=name, ip_address=ip,
-                interface_name=iface_name,
-                bytes_in=b_in, bytes_out=b_out,
-                packets_in=p_in, packets_out=p_out,
-                collected_at=datetime.now()
-            ))
-            saved += 1
-
-        db_session.commit()
-        db_session.close()
-        logger.info(f"{name} — {saved} interface berhasil disimpan")
+        logger.info(f"{name} — {len(interfaces)} interface dikumpulkan")
+        return interfaces
 
     except Exception as e:
         logger.error(f"Bandwidth error pada {name} ({ip}): {e}")
+        return []
 
 
 def run():
-    # Jika semua device down → pause total agar log tidak membengkak
     if device_state.all_down():
         logger.warning("=== Bandwidth Monitor PAUSE — semua device DOWN ===")
         return
@@ -102,5 +100,15 @@ def run():
     if not devices:
         logger.warning("Tidak ada device aktif di database")
         return
+
+    collected_at = datetime.now().isoformat()
     for device in devices:
-        poll_device(device)
+        interfaces = poll_device(device)
+        if interfaces:
+            ws_client.send({
+                'type':         'interface_traffic',
+                'device':       device['name'],
+                'ip_address':   device['ip_address'],
+                'collected_at': collected_at,
+                'interfaces':   interfaces,
+            })

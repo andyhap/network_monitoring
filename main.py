@@ -2,21 +2,23 @@ import schedule
 import time
 import os
 from dotenv import load_dotenv
-from models.database import init_db
 from collectors import ping_monitor, snmp_collector, bandwidth
 from utils.logger import get_logger
-from backup import supabase_backup
+from utils import ws_client
 
 load_dotenv()
 logger = get_logger('main')
 
-def main():
-    logger.info("==============================")
-    logger.info("  Network Monitoring Starting ")
-    logger.info("==============================")
 
-    # Inisialisasi database
-    init_db()
+def main():
+    logger.info("==========================================")
+    logger.info("  Network Monitoring — WebSocket Client   ")
+    logger.info("==========================================")
+
+    # Mulai WebSocket sender (background thread, reconnect otomatis)
+    server_url = os.getenv('WS_SERVER_URL', 'ws://localhost:8000')
+    ws_secret  = os.getenv('WS_SECRET', '')
+    ws_client.start(server_url, ws_secret)
 
     # Jalankan sekali langsung saat start
     ping_monitor.run()
@@ -32,21 +34,15 @@ def main():
     schedule.every(snmp_interval).seconds.do(snmp_collector.run)
     schedule.every(bw_interval).seconds.do(bandwidth.run)
 
-    # Backup ke Supabase setiap 60 menit
-    schedule.every(60).minutes.do(supabase_backup.run)
-    logger.info("Backup scheduler aktif — interval: 60 menit")
-
     logger.info(f"Scheduler aktif — ping:{ping_interval}s | snmp:{snmp_interval}s | bw:{bw_interval}s")
 
-
-    # Loop scheduler
     while True:
         try:
             schedule.run_pending()
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
-
         time.sleep(1)
+
 
 if __name__ == '__main__':
     main()

@@ -1,8 +1,9 @@
+import os
 from datetime import datetime
 from easysnmp import Session, EasySNMPError
-from models.database import get_session, SnmpMetric, get_active_devices
+from models.database import get_active_devices
 from utils.logger import get_logger
-from utils import device_state
+from utils import device_state, ws_client
 
 logger = get_logger('snmp_collector')
 
@@ -15,14 +16,11 @@ OIDS = {
     'totalInterfaces': '1.3.6.1.2.1.2.1.0',
 }
 
-# OID MAC address interface pertama (biasanya ether1/eth0)
 OID_IF_MAC = '1.3.6.1.2.1.2.2.1.6.2'  # ifPhysAddress index 2 (skip loopback)
 
 
 def format_mac(raw_value: str) -> str:
-    """Konversi raw bytes MAC address ke format XX:XX:XX:XX:XX:XX"""
     try:
-        # easysnmp return MAC sebagai string bytes
         mac_bytes = [f"{ord(c):02X}" for c in raw_value]
         if len(mac_bytes) == 6:
             return ':'.join(mac_bytes)
@@ -31,71 +29,54 @@ def format_mac(raw_value: str) -> str:
     return raw_value
 
 
-def poll_device(device: dict):
+def poll_device(device: dict) -> list:
+    """
+    Poll SNMP metrics dari satu device.
+    Return list of {'name': ..., 'value': ...}, atau [] jika skip/gagal.
+    """
     name      = device['name']
     ip        = device['ip_address']
     community = device['snmp_community']
 
-    # Skip device yang diketahui down dari hasil ping terakhir
     if not device_state.is_up(name):
         logger.warning(f"{name} ({ip}) — DOWN (ping), SNMP dilewati")
-        return
+        return []
 
+    metrics = []
     try:
-        # timeout=2, retries=1 → maks 4s per OID (vs 15s sebelumnya)
+        # timeout=2, retries=1 → maks 4s per OID
         snmp_session = Session(
             hostname=ip, community=community,
             version=2, remote_port=161, timeout=2, retries=1
         )
-        db_session = get_session()
-        now = datetime.now()
 
-        # Poll OID standar
         for metric_name, oid in OIDS.items():
             try:
                 result = snmp_session.get(oid)
                 value  = str(result.value)
                 logger.info(f"{name} | {metric_name}: {value}")
-                db_session.add(SnmpMetric(
-                    device=name, ip_address=ip,
-                    metric_name=metric_name, metric_value=value,
-                    collected_at=now
-                ))
+                metrics.append({'name': metric_name, 'value': value})
             except EasySNMPError as e:
                 logger.warning(f"{name} | {metric_name} gagal: {e}")
 
-        # Poll MAC address
         try:
             mac_result = snmp_session.get(OID_IF_MAC)
             mac_value  = format_mac(mac_result.value)
             logger.info(f"{name} | macAddress: {mac_value}")
-            db_session.add(SnmpMetric(
-                device=name, ip_address=ip,
-                metric_name='macAddress',
-                metric_value=mac_value,
-                collected_at=now
-            ))
+            metrics.append({'name': 'macAddress', 'value': mac_value})
         except EasySNMPError as e:
             logger.warning(f"{name} | macAddress gagal: {e}")
 
-        # Simpan monitoringInterval (dari .env / config)
-        import os
         interval = os.getenv('PING_INTERVAL', '30')
-        db_session.add(SnmpMetric(
-            device=name, ip_address=ip,
-            metric_name='monitoringInterval',
-            metric_value=f"{interval} Seconds",
-            collected_at=now
-        ))
+        metrics.append({'name': 'monitoringInterval', 'value': f"{interval} Seconds"})
 
-        db_session.commit()
-        db_session.close()
     except Exception as e:
         logger.error(f"SNMP error {name} ({ip}): {e}")
 
+    return metrics
+
 
 def run():
-    # Jika semua device down → pause total agar log tidak membengkak
     if device_state.all_down():
         logger.warning("=== SNMP Collector PAUSE — semua device DOWN ===")
         return
@@ -105,5 +86,15 @@ def run():
     if not devices:
         logger.warning("Tidak ada device aktif di database")
         return
+
+    collected_at = datetime.now().isoformat()
     for device in devices:
-        poll_device(device)
+        metrics = poll_device(device)
+        if metrics:
+            ws_client.send({
+                'type':         'snmp_metrics',
+                'device':       device['name'],
+                'ip_address':   device['ip_address'],
+                'collected_at': collected_at,
+                'metrics':      metrics,
+            })
