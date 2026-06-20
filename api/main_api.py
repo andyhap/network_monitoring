@@ -530,19 +530,45 @@ WS_SECRET = os.getenv('WS_SECRET', '')
 class ConnectionManager:
     def __init__(self):
         self._clients: List[WebSocket] = []
+        self._last_data_at: Optional[datetime] = None
 
     async def connect(self, ws: WebSocket):
         await ws.accept()
+        was_empty = len(self._clients) == 0
         self._clients.append(ws)
-        logger.info(f"[WS] Client terhubung dari {ws.client.host} — total: {len(self._clients)}")
+        if was_empty:
+            logger.info(
+                f"[WS] Client terhubung dari {ws.client.host} "
+                f"— monitoring RESUME (data mulai diterima)"
+            )
+        else:
+            logger.info(
+                f"[WS] Client terhubung dari {ws.client.host} "
+                f"— total: {len(self._clients)}"
+            )
 
     def disconnect(self, ws: WebSocket):
-        self._clients.remove(ws)
-        logger.info(f"[WS] Client terputus — total: {len(self._clients)}")
+        if ws in self._clients:
+            self._clients.remove(ws)
+        if len(self._clients) == 0:
+            logger.warning(
+                "[WS] Semua client terputus — monitoring PAUSE "
+                "(tidak ada data yang masuk sampai client reconnect)"
+            )
+        else:
+            logger.info(f"[WS] Client terputus — total: {len(self._clients)}")
+
+    def record_data(self) -> None:
+        """Dipanggil setiap kali data berhasil disimpan ke DB."""
+        self._last_data_at = datetime.now()
 
     @property
     def count(self) -> int:
         return len(self._clients)
+
+    @property
+    def last_data_at(self) -> Optional[datetime]:
+        return self._last_data_at
 
 
 ws_manager = ConnectionManager()
@@ -723,6 +749,7 @@ async def websocket_endpoint(websocket: WebSocket, key: str = Query(default=''))
             try:
                 # Handler sinkron dijalankan di thread pool agar tidak blokir event loop
                 await asyncio.to_thread(handler, payload)
+                ws_manager.record_data()
                 await websocket.send_json({"status": "ok", "type": msg_type})
             except KeyError as e:
                 await websocket.send_json({
@@ -738,15 +765,23 @@ async def websocket_endpoint(websocket: WebSocket, key: str = Query(default=''))
                 })
 
     except WebSocketDisconnect:
+        # Client menutup koneksi secara bersih
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        # Koneksi putus tidak bersih (network error, timeout, dll)
+        logger.error(f"[WS] Koneksi error dari {websocket.client.host}: {e}")
         ws_manager.disconnect(websocket)
 
 
 @app.get("/ws/status")
 def ws_status():
-    """Info WebSocket server — jumlah client yang terkoneksi"""
+    """Info WebSocket server — status koneksi client dan kapan data terakhir diterima"""
+    last = ws_manager.last_data_at
     return {
-        "status":           "ok",
+        "status":            "ok",
         "connected_clients": ws_manager.count,
-        "accepted_types":   list(_WS_HANDLERS),
-        "auth_required":    bool(WS_SECRET),
+        "monitoring_active": ws_manager.count > 0,
+        "last_data_at":      last.isoformat() if last else None,
+        "accepted_types":    list(_WS_HANDLERS),
+        "auth_required":     bool(WS_SECRET),
     }
