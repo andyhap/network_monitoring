@@ -16,17 +16,21 @@ OIDS = {
     'totalInterfaces': '1.3.6.1.2.1.2.1.0',
 }
 
-OID_IF_MAC = '1.3.6.1.2.1.2.2.1.6.2'  # ifPhysAddress index 2 (skip loopback)
+OID_IF_MAC_TABLE = '1.3.6.1.2.1.2.2.1.6'  # ifPhysAddress table (walk)
+
+_SNMP_NO_VALUE = {'NOSUCHOBJECT', 'NOSUCHINSTANCE', 'ENDOFMIBVIEW', ''}
 
 
-def format_mac(raw_value: str) -> str:
+def format_mac(raw_value: str) -> str | None:
+    if raw_value in _SNMP_NO_VALUE:
+        return None
     try:
         mac_bytes = [f"{ord(c):02X}" for c in raw_value]
         if len(mac_bytes) == 6:
             return ':'.join(mac_bytes)
     except Exception:
         pass
-    return raw_value
+    return None
 
 
 def poll_device(device: dict) -> list:
@@ -60,10 +64,18 @@ def poll_device(device: dict) -> list:
                 logger.warning(f"{name} | {metric_name} gagal: {e}")
 
         try:
-            mac_result = snmp_session.get(OID_IF_MAC)
-            mac_value  = format_mac(mac_result.value)
-            logger.info(f"{name} | macAddress: {mac_value}")
-            metrics.append({'name': 'macAddress', 'value': mac_value})
+            mac_entries = snmp_session.walk(OID_IF_MAC_TABLE)
+            mac_value = None
+            for entry in mac_entries:
+                candidate = format_mac(entry.value)
+                if candidate and candidate != '00:00:00:00:00:00':
+                    mac_value = candidate
+                    break
+            if mac_value:
+                logger.info(f"{name} | macAddress: {mac_value}")
+                metrics.append({'name': 'macAddress', 'value': mac_value})
+            else:
+                logger.warning(f"{name} | macAddress tidak ditemukan (semua interface kosong/loopback)")
         except EasySNMPError as e:
             logger.warning(f"{name} | macAddress gagal: {e}")
 
