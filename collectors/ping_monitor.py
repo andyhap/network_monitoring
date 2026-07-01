@@ -65,6 +65,7 @@ def run():
 
     if was_all_down:
         logger.info("=== Device kembali UP — monitoring RESUME ===")
+        device_state.mark_recovery()
 
     # Kirim semua hasil ping ke server via WebSocket
     collected_at = datetime.now().isoformat()

@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 from collectors import ping_monitor, snmp_collector, bandwidth
 from utils.logger import get_logger
-from utils import ws_client
+from utils import ws_client, device_state
 
 load_dotenv()
 logger = get_logger('main')
@@ -46,6 +46,10 @@ def main():
     while True:
         try:
             schedule.run_pending()
+            if device_state.consume_recovery():
+                logger.info("[Recovery] Device UP setelah pause — trigger immediate SNMP & Bandwidth")
+                snmp_collector.run()
+                bandwidth.run()
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
         time.sleep(1)

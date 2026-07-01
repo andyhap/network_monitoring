@@ -6,10 +6,26 @@ Schedule library berjalan single-threaded, jadi tidak butuh lock.
 """
 
 _status: dict[str, bool] = {}  # {device_name: is_up}
+_recovery_pending: bool = False
 
 
 def update(device: str, is_up: bool) -> None:
     _status[device] = is_up
+
+
+def mark_recovery() -> None:
+    """Dipanggil oleh ping_monitor saat transisi all_down → ada yang UP."""
+    global _recovery_pending
+    _recovery_pending = True
+
+
+def consume_recovery() -> bool:
+    """Return True sekali saat baru recovery, lalu reset. Dipanggil di main loop."""
+    global _recovery_pending
+    if _recovery_pending:
+        _recovery_pending = False
+        return True
+    return False
 
 
 def is_up(device: str) -> bool:
