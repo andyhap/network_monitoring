@@ -1,15 +1,17 @@
-import paramiko
-import icmplib
+import json
+import uuid
+import asyncio
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from utils.logger import get_logger
-from models.database import get_session, DeviceStatus, Device, get_active_devices, SnmpMetric, InterfaceTraffic
+from models.database import (
+    get_session, DeviceStatus, Device, SnmpMetric, InterfaceTraffic,
+)
 from backup.supabase_backup import run as run_supabase_backup
-import asyncio
 
 load_dotenv()
 logger = get_logger('api')
@@ -27,57 +29,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REBOOT_COMMANDS = {
-    'mikrotik': '/system reboot',
-    'openwrt':  'reboot',
-    'linux':    'sudo reboot',
-}
-
-
-# ── Helper SSH ───────────────────────────────────────────────
-
-def ssh_execute(host, user, password, command, timeout=10):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(hostname=host, username=user, password=password,
-                       timeout=timeout, look_for_keys=False, allow_agent=False)
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        out = stdout.read().decode('utf-8', errors='ignore').strip()
-        err = stderr.read().decode('utf-8', errors='ignore').strip()
-        return {'success': True, 'output': out, 'error': err}
-    except paramiko.AuthenticationException:
-        return {'success': False, 'output': '', 'error': 'Authentication failed'}
-    except paramiko.ssh_exception.NoValidConnectionsError:
-        return {'success': False, 'output': '', 'error': 'Cannot connect to host'}
-    except Exception as e:
-        return {'success': False, 'output': '', 'error': str(e)}
-    finally:
-        client.close()
-
-
-def get_device_or_404(name: str) -> Device:
-    """Ambil device aktif dari DB, raise 404 jika tidak ada"""
-    session = get_session()
-    try:
-        device = session.query(Device).filter(
-            Device.name == name,
-            Device.is_active == 1
-        ).first()
-        if not device:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Device '{name}' tidak ditemukan atau nonaktif"
-            )
-        return {
-            'name':      device.name,
-            'ip':        device.ip_address,
-            'type':      device.type,
-            'ssh_user':  device.ssh_user,
-            'ssh_pass':  device.ssh_pass,
-        }
-    finally:
-        session.close()
+# ── WebSocket state ───────────────────────────────────────────
+# Hanya satu ws_client (monitoring machine lokal) yang terhubung
+_active_ws: Optional[WebSocket] = None
+_pending_commands: dict[str, asyncio.Future] = {}
 
 
 # ── Pydantic Models ──────────────────────────────────────────
@@ -107,20 +62,179 @@ class DeviceUpdate(BaseModel):
     is_active:      Optional[int] = None
 
 
+# ── Helper DB ────────────────────────────────────────────────
+
+def get_device_or_404(name: str) -> dict:
+    """Ambil device aktif dari DB, raise 404 jika tidak ada."""
+    session = get_session()
+    try:
+        device = session.query(Device).filter(
+            Device.name == name,
+            Device.is_active == 1
+        ).first()
+        if not device:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Device '{name}' tidak ditemukan atau nonaktif"
+            )
+        return {
+            'name':      device.name,
+            'ip':        device.ip_address,
+            'type':      device.type,
+            'ssh_user':  device.ssh_user,
+            'ssh_pass':  device.ssh_pass,
+        }
+    finally:
+        session.close()
+
+
+# ── WS endpoint ──────────────────────────────────────────────
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    global _active_ws
+    await websocket.accept()
+    _active_ws = websocket
+    logger.info("[WS] ws_client terhubung dari monitoring machine")
+
+    try:
+        async for raw in websocket.iter_text():
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = msg.get("type")
+
+            if msg_type == "result":
+                # Hasil command (reboot/ping) dari ws_client
+                req_id = msg.get("request_id", "")
+                fut    = _pending_commands.get(req_id)
+                if fut and not fut.done():
+                    fut.set_result(msg)
+
+            elif msg_type == "ping_result":
+                await asyncio.to_thread(_save_ping_result, msg)
+                await websocket.send_text('{"status":"ok"}')
+
+            elif msg_type == "snmp_metrics":
+                await asyncio.to_thread(_save_snmp_metrics, msg)
+                await websocket.send_text('{"status":"ok"}')
+
+            elif msg_type == "interface_traffic":
+                await asyncio.to_thread(_save_interface_traffic, msg)
+                await websocket.send_text('{"status":"ok"}')
+
+            else:
+                await websocket.send_text('{"status":"ok"}')
+
+    except WebSocketDisconnect:
+        logger.warning("[WS] ws_client terputus")
+    except Exception as e:
+        logger.error(f"[WS] Error: {e}")
+    finally:
+        _active_ws = None
+        for fut in _pending_commands.values():
+            if not fut.done():
+                fut.cancel()
+        _pending_commands.clear()
+
+
+# ── WS data savers ───────────────────────────────────────────
+
+def _save_ping_result(msg: dict) -> None:
+    session = get_session()
+    try:
+        ts = datetime.fromisoformat(msg['collected_at']) if msg.get('collected_at') else datetime.now()
+        session.add(DeviceStatus(
+            device=msg['device'], ip_address=msg['ip_address'],
+            status=msg['status'], latency_ms=msg.get('latency_ms'),
+            checked_at=ts,
+        ))
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"[WS] Gagal simpan ping_result: {e}")
+    finally:
+        session.close()
+
+
+def _save_snmp_metrics(msg: dict) -> None:
+    session = get_session()
+    try:
+        ts = datetime.fromisoformat(msg['collected_at']) if msg.get('collected_at') else datetime.now()
+        for m in msg.get('metrics', []):
+            session.add(SnmpMetric(
+                device=msg['device'], ip_address=msg['ip_address'],
+                metric_name=m['name'], metric_value=str(m['value']),
+                collected_at=ts,
+            ))
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"[WS] Gagal simpan snmp_metrics: {e}")
+    finally:
+        session.close()
+
+
+def _save_interface_traffic(msg: dict) -> None:
+    session = get_session()
+    try:
+        ts = datetime.fromisoformat(msg['collected_at']) if msg.get('collected_at') else datetime.now()
+        for iface in msg.get('interfaces', []):
+            session.add(InterfaceTraffic(
+                device=msg['device'], ip_address=msg['ip_address'],
+                interface_name=iface['name'],
+                bytes_in=iface.get('bytes_in', 0),
+                bytes_out=iface.get('bytes_out', 0),
+                packets_in=iface.get('packets_in', 0),
+                packets_out=iface.get('packets_out', 0),
+                collected_at=ts,
+            ))
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"[WS] Gagal simpan interface_traffic: {e}")
+    finally:
+        session.close()
+
+
+# ── WS command sender ────────────────────────────────────────
+
+async def _send_command(cmd: dict, timeout: float = 30) -> dict:
+    """Kirim command ke ws_client lewat WS, tunggu hasilnya."""
+    if _active_ws is None:
+        raise HTTPException(503, detail="ws_client tidak terhubung ke server")
+
+    request_id             = str(uuid.uuid4())
+    cmd["request_id"]      = request_id
+    future: asyncio.Future = asyncio.get_running_loop().create_future()
+    _pending_commands[request_id] = future
+
+    try:
+        await _active_ws.send_text(json.dumps(cmd, default=str))
+        return await asyncio.wait_for(future, timeout=timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Timeout — ws_client tidak merespons dalam 30 detik")
+    finally:
+        _pending_commands.pop(request_id, None)
+
+
 # ── Info Endpoints ───────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {
-        "service": "Network Monitoring API",
-        "version": "2.0.0",
-        "status":  "running",
-        "time":    datetime.now().isoformat()
+        "service":    "Network Monitoring API",
+        "version":    "2.0.0",
+        "status":     "running",
+        "ws_client":  "connected" if _active_ws else "disconnected",
+        "time":       datetime.now().isoformat()
     }
 
 @app.get("/status")
 def get_all_status():
-    """Status terbaru semua device dari database"""
+    """Status terbaru semua device dari database."""
     from sqlalchemy import func
     session = get_session()
     try:
@@ -150,7 +264,7 @@ def get_all_status():
 
 @app.get("/status/{device_name}")
 def get_device_status(device_name: str):
-    """Status terbaru satu device"""
+    """Status terbaru satu device."""
     session = get_session()
     try:
         record = (
@@ -162,12 +276,12 @@ def get_device_status(device_name: str):
         if not record:
             raise HTTPException(status_code=404, detail="Belum ada data status")
         return {
-            "status":     "ok",
-            "device":     record.device,
-            "ip_address": record.ip_address,
+            "status":      "ok",
+            "device":      record.device,
+            "ip_address":  record.ip_address,
             "ping_status": record.status,
-            "latency_ms": record.latency_ms,
-            "checked_at": record.checked_at.isoformat(),
+            "latency_ms":  record.latency_ms,
+            "checked_at":  record.checked_at.isoformat(),
         }
     finally:
         session.close()
@@ -176,18 +290,15 @@ def get_device_status(device_name: str):
 # ── Action Endpoints ─────────────────────────────────────────
 
 @app.post("/ping")
-def ping_now(req: PingRequest):
-    """Ping manual ke device, simpan ke DB, return hasil"""
+async def ping_now(req: PingRequest):
+    """Ping manual ke device via ws_client (lokal), simpan ke DB."""
     device = get_device_or_404(req.device)
     ip     = device['ip']
 
-    try:
-        host    = icmplib.ping(ip, count=4, interval=0.5, timeout=2, privileged=False)
-        status  = 'up' if host.is_alive else 'down'
-        latency = round(host.avg_rtt, 3) if host.is_alive else None
-    except Exception as e:
-        status, latency = 'down', None
-        logger.error(f"Ping error {req.device}: {e}")
+    result      = await _send_command({"type": "command", "action": "ping", "device": device['name'], "ip": ip})
+    status      = result.get('status', 'down')
+    latency     = result.get('latency_ms')
+    packet_loss = result.get('packet_loss')
 
     session = get_session()
     try:
@@ -205,33 +316,37 @@ def ping_now(req: PingRequest):
 
     logger.info(f"[API] Ping {req.device} ({ip}) — {status.upper()} | {latency} ms")
     return {
-        "status":      "ok",
-        "device":      req.device,
-        "ip_address":  ip,
-        "ping_result": status,
-        "latency_ms":  latency,
-        "checked_at":  datetime.now().isoformat(),
+        "status":       "ok",
+        "device":       req.device,
+        "ip_address":   ip,
+        "ping_result":  status,
+        "latency_ms":   latency,
+        "packet_loss":  packet_loss,
+        "checked_at":   datetime.now().isoformat(),
     }
 
 @app.post("/reboot")
-def reboot_device(req: RebootRequest):
-    """Reboot device via SSH — credentials dari DB"""
+async def reboot_device(req: RebootRequest):
+    """Reboot device via ws_client (SSH dari lokal) — credentials dari DB."""
     device = get_device_or_404(req.device)
-    ip     = device['ip']
-    user   = device['ssh_user']
-    passwd = device['ssh_pass']
-    cmd    = REBOOT_COMMANDS.get(device['type'], 'reboot')
 
-    logger.info(f"[API] Reboot request: {req.device} ({ip})")
-    result = ssh_execute(ip, user, passwd, cmd, timeout=10)
+    logger.info(f"[API] Reboot request: {req.device} ({device['ip']})")
+    result = await _send_command({
+        "type":        "command",
+        "action":      "reboot",
+        "device":      device['name'],
+        "ip":          device['ip'],
+        "device_type": device['type'],
+        "ssh_user":    device['ssh_user'],
+        "ssh_pass":    device['ssh_pass'],
+    })
 
-    if not result['success']:
-        err = result['error']
-        if not any(x in err for x in ['Connection reset', 'EOF', 'timed out']):
-            logger.error(f"Reboot gagal {req.device}: {err}")
-            raise HTTPException(status_code=500, detail=f"Reboot gagal: {err}")
+    if not result.get("success"):
+        err = result.get("error", "Unknown error")
+        logger.error(f"[API] Reboot gagal {req.device}: {err}")
+        raise HTTPException(status_code=500, detail=f"Reboot gagal: {err}")
 
-    logger.info(f"[API] Reboot command terkirim ke {req.device}")
+    logger.info(f"[API] Reboot berhasil: {req.device}")
     return {
         "status":  "ok",
         "device":  req.device,
@@ -245,22 +360,22 @@ def reboot_device(req: RebootRequest):
 
 @app.get("/api/devices")
 def list_devices():
-    """List semua device (aktif dan nonaktif)"""
+    """List semua device (aktif dan nonaktif)."""
     session = get_session()
     try:
         devices = session.query(Device).order_by(Device.id).all()
         return {
             "status": "ok",
             "data": [{
-                "id":          d.id,
-                "name":        d.name,
-                "ip_address":  d.ip_address,
-                "type":        d.type,
-                "ssh_user":    d.ssh_user,
+                "id":             d.id,
+                "name":           d.name,
+                "ip_address":     d.ip_address,
+                "type":           d.type,
+                "ssh_user":       d.ssh_user,
                 "snmp_community": d.snmp_community,
-                "is_active":   d.is_active,
-                "description": d.description,
-                "created_at":  d.created_at.isoformat(),
+                "is_active":      d.is_active,
+                "description":    d.description,
+                "created_at":     d.created_at.isoformat(),
             } for d in devices]
         }
     finally:
@@ -268,7 +383,7 @@ def list_devices():
 
 @app.post("/api/devices")
 def create_device(req: DeviceCreate):
-    """Tambah device baru — langsung dimonitor pada siklus berikutnya"""
+    """Tambah device baru — langsung dimonitor pada siklus berikutnya."""
     session = get_session()
     try:
         existing = session.query(Device).filter(Device.name == req.name).first()
@@ -299,14 +414,14 @@ def create_device(req: DeviceCreate):
 
 @app.put("/api/devices/{device_id}")
 def update_device(device_id: int, req: DeviceUpdate):
-    """Update detail device"""
+    """Update detail device."""
     session = get_session()
     try:
         device = session.query(Device).filter(Device.id == device_id).first()
         if not device:
             raise HTTPException(status_code=404, detail="Device tidak ditemukan")
 
-        for field, value in req.dict(exclude_none=True).items():
+        for field, value in req.model_dump(exclude_none=True).items():
             setattr(device, field, value)
         session.commit()
         logger.info(f"[API] Device diupdate: {device.name}")
@@ -321,7 +436,7 @@ def update_device(device_id: int, req: DeviceUpdate):
 
 @app.patch("/api/devices/{device_id}/toggle")
 def toggle_device(device_id: int):
-    """Toggle aktif/nonaktif device"""
+    """Toggle aktif/nonaktif device."""
     session = get_session()
     try:
         device = session.query(Device).filter(Device.id == device_id).first()
@@ -362,7 +477,6 @@ def delete_device(device_id: int):
         name       = device.name
         ip_address = device.ip_address
 
-        # Info device untuk disimpan sebagai metadata di archive
         device_info = {
             'id':             device.id,
             'name':           device.name,
@@ -382,10 +496,7 @@ def delete_device(device_id: int):
             client = get_supabase_client()
             now    = datetime.now().isoformat()
 
-            # Archive device_status
-            ds_records = session.query(DeviceStatus).filter(
-                DeviceStatus.device == name
-            ).all()
+            ds_records = session.query(DeviceStatus).filter(DeviceStatus.device == name).all()
             if ds_records:
                 client.table('deleted_device_status').insert([{
                     'device':      r.device,
@@ -398,12 +509,8 @@ def delete_device(device_id: int):
                 } for r in ds_records]).execute()
                 logger.info(f"[API] Archive {len(ds_records)} device_status records → Supabase")
 
-            # Archive snmp_metrics
-            sm_records = session.query(SnmpMetric).filter(
-                SnmpMetric.device == name
-            ).all()
+            sm_records = session.query(SnmpMetric).filter(SnmpMetric.device == name).all()
             if sm_records:
-                # Batch 500 agar tidak timeout
                 for i in range(0, len(sm_records), 500):
                     batch = sm_records[i:i+500]
                     client.table('deleted_snmp_metrics').insert([{
@@ -417,10 +524,7 @@ def delete_device(device_id: int):
                     } for r in batch]).execute()
                 logger.info(f"[API] Archive {len(sm_records)} snmp_metrics records → Supabase")
 
-            # Archive interface_traffic
-            it_records = session.query(InterfaceTraffic).filter(
-                InterfaceTraffic.device == name
-            ).all()
+            it_records = session.query(InterfaceTraffic).filter(InterfaceTraffic.device == name).all()
             if it_records:
                 for i in range(0, len(it_records), 500):
                     batch = it_records[i:i+500]
@@ -445,29 +549,17 @@ def delete_device(device_id: int):
                 detail=f"Gagal archive data ke Supabase sebelum hapus: {e}"
             )
 
-        # ── Step 2: Hapus semua data monitoring dari lokal ───
-        ds_deleted = session.query(DeviceStatus).filter(
-            DeviceStatus.device == name
-        ).delete()
-
-        sm_deleted = session.query(SnmpMetric).filter(
-            SnmpMetric.device == name
-        ).delete()
-
-        it_deleted = session.query(InterfaceTraffic).filter(
-            InterfaceTraffic.device == name
-        ).delete()
-
-        # ── Step 3: Hapus device ─────────────────────────────
+        # ── Step 2 & 3: Hapus dari lokal ─────────────────────
+        ds_deleted = session.query(DeviceStatus).filter(DeviceStatus.device == name).delete()
+        sm_deleted = session.query(SnmpMetric).filter(SnmpMetric.device == name).delete()
+        it_deleted = session.query(InterfaceTraffic).filter(InterfaceTraffic.device == name).delete()
         session.delete(device)
         session.commit()
 
         logger.info(
             f"[API] Device '{name}' dihapus. "
-            f"Data dihapus: {ds_deleted} status, "
-            f"{sm_deleted} snmp, {it_deleted} traffic"
+            f"Data: {ds_deleted} status, {sm_deleted} snmp, {it_deleted} traffic"
         )
-
         return {
             "status":  "ok",
             "message": f"Device '{name}' berhasil dihapus beserta semua datanya",
@@ -491,12 +583,12 @@ def delete_device(device_id: int):
     finally:
         session.close()
 
+
 # ── Backup Endpoints ─────────────────────────────────────────
 
 async def execute_background_backup():
     try:
         logger.info("[API] Memulai proses backup manual ke Supabase...")
-        # Panggil fungsi yang sudah di-import tadi
         await asyncio.to_thread(run_supabase_backup)
         logger.info("[API] Backup manual ke Supabase berhasil diselesaikan!")
     except Exception as e:
@@ -504,18 +596,17 @@ async def execute_background_backup():
 
 @app.post("/api/backup/manual")
 def trigger_manual_backup(background_tasks: BackgroundTasks):
-    """Memicu backup database manual ke Supabase via background task"""
+    """Memicu backup database manual ke Supabase via background task."""
     try:
         background_tasks.add_task(execute_background_backup)
-        
         return {
-            "status": "accepted",
-            "message": "Backup akan dilakukan di background.",
+            "status":    "accepted",
+            "message":   "Backup akan dilakukan di background.",
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
         logger.error(f"[API] Gagal memicu endpoint backup: {str(e)}")
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail=f"Terjadi kesalahan internal server saat memicu backup: {str(e)}"
         )
