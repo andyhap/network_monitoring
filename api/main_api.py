@@ -38,10 +38,12 @@ _pending_commands: dict[str, asyncio.Future] = {}
 # ── Pydantic Models ──────────────────────────────────────────
 
 class PingRequest(BaseModel):
-    device: str
+    device:    Optional[str] = None
+    device_id: Optional[int] = None
 
 class RebootRequest(BaseModel):
-    device: str
+    device:    Optional[str] = None
+    device_id: Optional[int] = None
 
 class DeviceCreate(BaseModel):
     name:           str
@@ -64,25 +66,28 @@ class DeviceUpdate(BaseModel):
 
 # ── Helper DB ────────────────────────────────────────────────
 
-def get_device_or_404(name: str) -> dict:
-    """Ambil device aktif dari DB, raise 404 jika tidak ada."""
+def get_device_or_404(name: Optional[str] = None, device_id: Optional[int] = None) -> dict:
+    """Ambil device aktif dari DB by name atau id, raise 404 jika tidak ada."""
     session = get_session()
     try:
-        device = session.query(Device).filter(
-            Device.name == name,
-            Device.is_active == 1
-        ).first()
+        q = session.query(Device).filter(Device.is_active == 1)
+        if device_id is not None:
+            device = q.filter(Device.id == device_id).first()
+            label  = f"id={device_id}"
+        elif name:
+            device = q.filter(Device.name == name).first()
+            label  = f"'{name}'"
+        else:
+            raise HTTPException(status_code=422, detail="Harus isi 'device' atau 'device_id'")
+
         if not device:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Device '{name}' tidak ditemukan atau nonaktif"
-            )
+            raise HTTPException(status_code=404, detail=f"Device {label} tidak ditemukan atau nonaktif")
         return {
-            'name':      device.name,
-            'ip':        device.ip_address,
-            'type':      device.type,
-            'ssh_user':  device.ssh_user,
-            'ssh_pass':  device.ssh_pass,
+            'name':     device.name,
+            'ip':       device.ip_address,
+            'type':     device.type,
+            'ssh_user': device.ssh_user,
+            'ssh_pass': device.ssh_pass,
         }
     finally:
         session.close()
@@ -292,7 +297,7 @@ def get_device_status(device_name: str):
 @app.post("/ping")
 async def ping_now(req: PingRequest):
     """Ping manual ke device via ws_client (lokal), simpan ke DB."""
-    device = get_device_or_404(req.device)
+    device = get_device_or_404(req.device, req.device_id)
     ip     = device['ip']
 
     result      = await _send_command({"type": "command", "action": "ping", "device": device['name'], "ip": ip})
@@ -303,21 +308,21 @@ async def ping_now(req: PingRequest):
     session = get_session()
     try:
         session.add(DeviceStatus(
-            device=req.device, ip_address=ip,
+            device=device['name'], ip_address=ip,
             status=status, latency_ms=latency,
             checked_at=datetime.now()
         ))
         session.commit()
     except Exception as e:
         session.rollback()
-        logger.error(f"DB error ping {req.device}: {e}")
+        logger.error(f"DB error ping {device['name']}: {e}")
     finally:
         session.close()
 
-    logger.info(f"[API] Ping {req.device} ({ip}) — {status.upper()} | {latency} ms")
+    logger.info(f"[API] Ping {device['name']} ({ip}) — {status.upper()} | {latency} ms")
     return {
         "status":       "ok",
-        "device":       req.device,
+        "device":       device['name'],
         "ip_address":   ip,
         "ping_result":  status,
         "latency_ms":   latency,
@@ -328,9 +333,9 @@ async def ping_now(req: PingRequest):
 @app.post("/reboot")
 async def reboot_device(req: RebootRequest):
     """Reboot device via ws_client (SSH dari lokal) — credentials dari DB."""
-    device = get_device_or_404(req.device)
+    device = get_device_or_404(req.device, req.device_id)
 
-    logger.info(f"[API] Reboot request: {req.device} ({device['ip']})")
+    logger.info(f"[API] Reboot request: {device['name']} ({device['ip']})")
     result = await _send_command({
         "type":        "command",
         "action":      "reboot",
@@ -343,14 +348,14 @@ async def reboot_device(req: RebootRequest):
 
     if not result.get("success"):
         err = result.get("error", "Unknown error")
-        logger.error(f"[API] Reboot gagal {req.device}: {err}")
+        logger.error(f"[API] Reboot gagal {device['name']}: {err}")
         raise HTTPException(status_code=500, detail=f"Reboot gagal: {err}")
 
-    logger.info(f"[API] Reboot berhasil: {req.device}")
+    logger.info(f"[API] Reboot berhasil: {device['name']}")
     return {
         "status":  "ok",
-        "device":  req.device,
-        "message": f"Reboot command berhasil dikirim ke {req.device}",
+        "device":  device['name'],
+        "message": f"Reboot command berhasil dikirim ke {device['name']}",
         "note":    "Device akan restart dalam beberapa detik",
         "sent_at": datetime.now().isoformat(),
     }
